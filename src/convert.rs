@@ -23,6 +23,10 @@ use std::time::Instant;
 pub struct Recipe {
     pub default: DType,
     pub overrides: Vec<(String, DType)>,
+    /// Hadamard-rotate matrices by default (measured on Qwen3.5-0.8B vs f32:
+    /// rotation lowers KL by 30-40% for 8/6-bit but raises it for 4-bit, where
+    /// imatrix-weighted rounding of salient channels matters more)
+    pub rotate: bool,
 }
 
 impl Recipe {
@@ -30,14 +34,19 @@ impl Recipe {
     pub fn parse(spec: &str) -> Result<Recipe> {
         let mut parts = spec.split(',');
         let base = parts.next().unwrap_or("q8").trim();
-        let (default, mut overrides): (DType, Vec<(String, DType)>) = match base {
-            "f32" => (DType::F32, vec![]),
-            "q8" => (DType::Q8R, vec![]),
-            // 4-bit body; the tied embedding/LM head and the tiny DeltaNet gate
-            // projections stay 8-bit (they are cheap and sensitive)
-            "q4" => (DType::Q4R, vec![("lm_head".into(), DType::Q8R), ("embed".into(), DType::Q8R), ("in_ba".into(), DType::Q8R)]),
-            "q4-fast" => (DType::Q4R, vec![("in_ba".into(), DType::Q8R)]),
-            _ => bail!("unknown quantization recipe '{base}' (f32 | q8 | q4 | q4-fast)"),
+        let q8 = |c: &str| (c.to_string(), DType::Q8R);
+        let (default, mut overrides, rotate): (DType, Vec<(String, DType)>, bool) = match base {
+            "f32" => (DType::F32, vec![], false),
+            "q8" => (DType::Q8R, vec![], true),
+            // 6-bit body, 8-bit tiny gate projections
+            "q6" => (DType::Q6R, vec![q8("in_ba")], true),
+            // 4-bit body; the tied embedding/LM head, the tiny DeltaNet gate
+            // projections and the attention/DeltaNet output projections (small
+            // but the most quantization-sensitive per byte) stay 8-bit
+            "q4" => (DType::Q4R, vec![q8("lm_head"), q8("embed"), q8("in_ba"), q8("out_proj"), q8("o_proj")], false),
+            // everything 4-bit except the gate projections: smallest/fastest, lossy
+            "q4-fast" => (DType::Q4R, vec![q8("in_ba")], false),
+            _ => bail!("unknown quantization recipe '{base}' (f32 | q8 | q6 | q4 | q4-fast)"),
         };
         for p in parts {
             let (k, v) = p.split_once('=').with_context(|| format!("bad override '{p}'"))?;
@@ -45,19 +54,30 @@ impl Recipe {
             overrides.retain(|(c, _)| c != k.trim());
             overrides.push((k.trim().to_string(), dt));
         }
-        Ok(Recipe { default, overrides })
+        Ok(Recipe { default, overrides, rotate })
     }
 
+    /// Keys: a class (`down`), a class in one layer (`down@3`), the whole MTP
+    /// block (`mtp`) or one class inside it (`mtp.qkv`). Later overrides win.
     pub fn dtype_for(&self, name: &str) -> DType {
-        // name like "L3.down", "mtp.L0.qkv", "lm_head"
+        // name like "L3.down", "mtp.L0.qkv", "mtp.fc", "lm_head"
         let class = name.rsplit('.').next().unwrap_or(name);
+        let is_mtp = name.starts_with("mtp.");
         let layer = name.split('.').find_map(|p| p.strip_prefix('L')).and_then(|n| n.parse::<usize>().ok());
         let mut dt = self.default;
         for (k, v) in &self.overrides {
-            match k.split_once('@') {
-                Some((c, l)) if c == class && layer.map(|x| x.to_string()) == Some(l.to_string()) => dt = *v,
-                None if k == class => dt = *v,
-                _ => {}
+            let hit = if k == "mtp" {
+                is_mtp
+            } else if let Some(c) = k.strip_prefix("mtp.") {
+                is_mtp && c == class
+            } else {
+                match k.split_once('@') {
+                    Some((c, l)) => c == class && !is_mtp && layer.map(|x| x.to_string()) == Some(l.to_string()),
+                    None => k == class,
+                }
+            };
+            if hit {
+                dt = *v;
             }
         }
         dt
@@ -101,9 +121,9 @@ impl Ctx<'_> {
         };
         let nrows = w.len() / k;
         let mut w = w;
-        // Hadamard-rotate the input dimension of every matrix except the tied
-        // embedding / LM head (its rows are also looked up as embeddings)
-        let rot = if self.rotate && dt != DType::F32 && out_name != "lm_head" && out_name != "embed" {
+        // Hadamard-rotate the input dimension of every quantized matrix (rows of
+        // a rotated embedding are un-rotated when looked up)
+        let rot = if self.rotate && dt != DType::F32 {
             crate::quant::rot_block(k)
         } else {
             0
@@ -193,9 +213,11 @@ fn convert_mlp(cx: &mut Ctx, cfg: &Config, src: &str, dst: &str) -> Result<()> {
     cx.matrix(&format!("{dst}.down"), vec![d], cfg.intermediate)
 }
 
-pub fn convert(hf_dir: &Path, out: &Path, recipe_name: &str, imatrix: Option<&Path>, rotate: bool) -> Result<()> {
+/// `rotate`: override the recipe's default Hadamard rotation.
+pub fn convert(hf_dir: &Path, out: &Path, recipe_name: &str, imatrix: Option<&Path>, rotate: Option<bool>) -> Result<()> {
     let t0 = Instant::now();
     let recipe = Recipe::parse(recipe_name)?;
+    let rotate = rotate.unwrap_or(recipe.rotate);
     let cfg_json: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(hf_dir.join("config.json")).context("read config.json")?,
     )?;

@@ -119,8 +119,8 @@ impl Engine {
             chunk: 256,
             spec: false,
             decode_threads: default_decode_threads(threads),
-            draft_k: env_or("FERRITE_DRAFT_K", 2usize),
-            draft_conf: env_or("FERRITE_DRAFT_CONF", 0.5f32),
+            draft_k: env_or("FERRITE_DRAFT_K", 4usize),
+            draft_conf: env_or("FERRITE_DRAFT_CONF", 0.3f32),
             last_logits: Vec::new(),
             logits_fresh: false,
             snapshot: None,
@@ -418,7 +418,6 @@ impl Engine {
         let h = self.hidden();
         let mut next = sampler.sample(&mut logits);
         sampler.accept(next);
-        let mut row = Vec::with_capacity(v);
         'outer: loop {
             stats.gen_tokens += 1;
             if stop.contains(&next) {
@@ -452,9 +451,7 @@ impl Engine {
             let mut corrected = None;
             let mut halt = None;
             for (i, &d) in drafts.iter().enumerate() {
-                row.clear();
-                row.extend_from_slice(&self.sc.logits[i * v..(i + 1) * v]);
-                let (y, acc) = sampler.sample_spec(&mut row, d);
+                let (y, acc) = sampler.sample_spec(&mut self.sc.logits[i * v..(i + 1) * v], d);
                 stats.drafted += 1;
                 if !acc || stop.contains(&d) {
                     corrected = Some(y);
@@ -484,11 +481,7 @@ impl Engine {
             }
             next = match corrected {
                 Some(y) => y,
-                None => {
-                    row.clear();
-                    row.extend_from_slice(&self.sc.logits[n * v..(n + 1) * v]);
-                    sampler.sample(&mut row)
-                }
+                None => sampler.sample(&mut self.sc.logits[n * v..(n + 1) * v]),
             };
             sampler.accept(next);
         }

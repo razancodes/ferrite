@@ -1,7 +1,7 @@
 //! Portable reference kernels (also used to cross-check the SIMD versions).
 
 use super::{QActs, QMat};
-use crate::quant::{BLOCK, DType, GROUP, IQ4NL};
+use crate::quant::{BLOCK, GROUP, qvalue};
 use half::f16;
 
 pub fn quantize_row(x: &[f32], q: &mut [i8], d: &mut [f32], m: &mut [f32]) {
@@ -27,7 +27,7 @@ pub unsafe fn gemm(w: &QMat, qa: &QActs, glo: usize, ghi: usize, out: *mut f32) 
     let nb = k / BLOCK;
     let gb = w.dtype.group_bytes(k);
     let data = w.bytes();
-    let qbytes = if w.dtype == DType::Q8R { 512 } else { 256 };
+    let qbytes = w.dtype.block_qbytes();
     for g in glo..ghi {
         let gd = &data[g * gb..(g + 1) * gb];
         let scales = &gd[nb * qbytes..];
@@ -40,14 +40,8 @@ pub unsafe fn gemm(w: &QMat, qa: &QActs, glo: usize, ghi: usize, out: *mut f32) 
                     let dw = f16::from_bits(u16::from_le_bytes([scales[so], scales[so + 1]])).to_f32();
                     let mut dot = 0i32;
                     for c in 0..BLOCK {
-                        let wu = if w.dtype == DType::Q8R {
-                            gd[b * 512 + (c / 4) * 64 + r * 4 + c % 4] as i32
-                        } else {
-                            let (p, hi) = if c < 16 { (c / 4, false) } else { (c / 4 - 4, true) };
-                            let byte = gd[b * 256 + p * 64 + r * 4 + c % 4];
-                            let nib = if hi { byte >> 4 } else { byte & 15 };
-                            IQ4NL[nib as usize] as i32 + 128
-                        };
+                        // same "u8 = value + 128" arithmetic as the SIMD kernels
+                        let wu = qvalue(w.dtype, gd, b, r, c) + 128;
                         dot += wu * xq[b * BLOCK + c] as i32;
                     }
                     let s = dot as f32 * qa.d[t * nb + b] - qa.m[t * nb + b];

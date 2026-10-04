@@ -15,6 +15,10 @@
 //!      low nibble -> column group p, high nibble -> column group p+4,
 //!      nibble indexes the IQ4_NL non-linear codebook
 //!      scales: nb x 16 x f16
+//! Q6R  quants: nb x 384 B, block b: low plane (256 B, laid out like Q4R) +
+//!      high plane (2 x 64 B: [h in 0..2][row in 0..16][4 bytes], 2 bits per
+//!      value, column group 4h+jj at bits 2jj..2jj+1); u6 = value + 32
+//!      scales: nb x 16 x f16
 //! ```
 //!
 //! Both formats store "u8 = 128 + signed value" so kernels share one correction
@@ -28,6 +32,7 @@ pub enum DType {
     F32,
     Q8R,
     Q4R,
+    Q6R,
     /// raw bytes (embedded blobs such as the tokenizer)
     U8,
 }
@@ -40,12 +45,23 @@ pub const BLOCK: usize = 32;
 pub const IQ4NL: [i8; 16] = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
 
 impl DType {
+    /// Bytes of packed quants per 32-column block of a 16-row group.
+    pub fn block_qbytes(self) -> usize {
+        match self {
+            DType::Q8R => 512,
+            DType::Q4R => 256,
+            DType::Q6R => 384,
+            _ => 0,
+        }
+    }
+
     pub fn group_bytes(self, k: usize) -> usize {
         let nb = k / BLOCK;
         match self {
             DType::F32 => GROUP * k * 4,
             DType::Q8R => nb * (512 + 32),
             DType::Q4R => nb * (256 + 32),
+            DType::Q6R => nb * (384 + 32),
             DType::U8 => GROUP * k,
         }
     }
@@ -61,6 +77,7 @@ impl DType {
             DType::F32 => 32.0,
             DType::Q8R => 8.5,
             DType::Q4R => 4.5,
+            DType::Q6R => 6.5,
             DType::U8 => 8.0,
         }
     }
@@ -69,6 +86,7 @@ impl DType {
             "f32" => Some(DType::F32),
             "q8" | "q8r" => Some(DType::Q8R),
             "q4" | "q4r" => Some(DType::Q4R),
+            "q6" | "q6r" => Some(DType::Q6R),
             _ => None,
         }
     }
@@ -142,6 +160,17 @@ pub fn rotate(x: &mut [f32], b: usize) {
     }
 }
 
+/// Inverse of `rotate`: x <- D H_b x (used to read embedding rows back out of a
+/// rotated tied embedding / LM head).
+pub fn unrotate(x: &mut [f32], b: usize) {
+    for blk in x.chunks_exact_mut(b) {
+        fwht(blk);
+    }
+    for (v, s) in x.iter_mut().zip(rot_signs()) {
+        *v *= s;
+    }
+}
+
 /// Quantize a row-major f32 matrix [rows, k] into `dt` (rows % 16 == 0, k % 32 == 0).
 /// `importance` (length k) optionally weights the per-column error (from an imatrix).
 pub fn quantize_matrix(w: &[f32], rows: usize, k: usize, dt: DType, importance: Option<&[f32]>) -> Vec<u8> {
@@ -169,6 +198,7 @@ pub fn quantize_matrix(w: &[f32], rows: usize, k: usize, dt: DType, importance: 
                     match dt {
                         DType::Q8R => pack_q8r_group(rows_w, k, gout),
                         DType::Q4R => pack_q4r_group(rows_w, k, gout, importance),
+                        DType::Q6R => pack_q6r_group(rows_w, k, gout, importance),
                         DType::F32 | DType::U8 => unreachable!(),
                     }
                 }
@@ -293,6 +323,110 @@ fn pack_q4r_group(w: &[f32], k: usize, out: &mut [u8], importance: Option<&[f32]
     }
 }
 
+/// Best scale for a block quantized to integers in [qmin, qmax]: candidate
+/// scales around amax/qmax, each refit by weighted least squares; returns the
+/// scale and writes the integers to `q`.
+pub fn quantize_block_uniform(x: &[f32], wts: &[f32], qmin: i32, qmax: i32, q: &mut [i32]) -> f32 {
+    let amax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
+    if amax < 1e-30 {
+        q.iter_mut().for_each(|v| *v = 0);
+        return 0.0;
+    }
+    let assign = |id: f32, q: &mut [i32]| {
+        for (j, &v) in x.iter().enumerate() {
+            q[j] = ((v * id).round_ties_even() as i32).clamp(qmin, qmax);
+        }
+    };
+    let fit = |q: &[i32]| {
+        let (mut sqx, mut sq2) = (0f32, 0f32);
+        for (j, &v) in x.iter().enumerate() {
+            let qf = q[j] as f32;
+            sqx += wts[j] * qf * v;
+            sq2 += wts[j] * qf * qf;
+        }
+        (sqx, sq2)
+    };
+    let (mut best_d, mut best) = (amax / qmax as f32, -1f32);
+    for itry in -8..=8 {
+        let id = (qmax as f32 + 0.125 * itry as f32) / amax;
+        assign(id, q);
+        let (sqx, sq2) = fit(q);
+        if sq2 > 0.0 && (best < 0.0 || sqx * sqx > best * sq2) {
+            best_d = sqx / sq2;
+            best = best_d * sqx;
+        }
+    }
+    assign(if best_d != 0.0 { 1.0 / best_d } else { 0.0 }, q);
+    let (sqx, sq2) = fit(q);
+    if sq2 > 0.0 { sqx / sq2 } else { best_d }
+}
+
+fn block_weights(x: &[f32], importance: Option<&[f32]>, col0: usize, wts: &mut [f32]) {
+    let sigma2 = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+    for j in 0..x.len() {
+        wts[j] = match importance {
+            Some(imp) => imp[col0 + j] * (sigma2 + x[j] * x[j]).sqrt(),
+            None => x[j] * x[j] + sigma2 * 0.25,
+        };
+    }
+}
+
+fn pack_q6r_group(w: &[f32], k: usize, out: &mut [u8], importance: Option<&[f32]>) {
+    let nb = k / BLOCK;
+    let (quants, scales) = out.split_at_mut(nb * 384);
+    let mut q = [0i32; BLOCK];
+    let mut wts = [0f32; BLOCK];
+    for r in 0..GROUP {
+        let row = &w[r * k..(r + 1) * k];
+        for b in 0..nb {
+            let x = &row[b * BLOCK..(b + 1) * BLOCK];
+            block_weights(x, importance, b * BLOCK, &mut wts);
+            let d = quantize_block_uniform(x, &wts, -32, 31, &mut q);
+            let d16 = f16::from_f32(d);
+            scales[(b * GROUP + r) * 2..(b * GROUP + r) * 2 + 2].copy_from_slice(&d16.to_bits().to_le_bytes());
+            let u: Vec<u8> = q.iter().map(|v| (v + 32) as u8).collect();
+            let qb = &mut quants[b * 384..(b + 1) * 384];
+            for p in 0..4 {
+                for m in 0..4 {
+                    qb[p * 64 + r * 4 + m] = (u[4 * p + m] & 15) | ((u[4 * (p + 4) + m] & 15) << 4);
+                }
+            }
+            for h in 0..2 {
+                for m in 0..4 {
+                    let mut byte = 0u8;
+                    for jj in 0..4 {
+                        byte |= (u[4 * (4 * h + jj) + m] >> 4) << (2 * jj);
+                    }
+                    qb[256 + h * 64 + r * 4 + m] = byte;
+                }
+            }
+        }
+    }
+}
+
+/// Signed integer stored for (row lane `r`, column `c`) of block `b` in a
+/// group's packed quants (value * scale = weight).
+#[inline]
+pub fn qvalue(dt: DType, gd: &[u8], b: usize, r: usize, c: usize) -> i32 {
+    let (j, m) = (c / 4, c % 4);
+    match dt {
+        DType::Q8R => gd[b * 512 + j * 64 + r * 4 + m] as i32 - 128,
+        DType::Q4R => {
+            let byte = gd[b * 256 + (j % 4) * 64 + r * 4 + m];
+            let nib = if j < 4 { byte & 15 } else { byte >> 4 };
+            IQ4NL[nib as usize] as i32
+        }
+        DType::Q6R => {
+            let byte = gd[b * 384 + (j % 4) * 64 + r * 4 + m];
+            let lo = if j < 4 { byte & 15 } else { byte >> 4 };
+            let hb = gd[b * 384 + 256 + (j / 4) * 64 + r * 4 + m];
+            let hi = (hb >> (2 * (j % 4))) & 3;
+            (lo | (hi << 4)) as i32 - 32
+        }
+        _ => unreachable!(),
+    }
+}
+
 /// Build a new matrix (same format) from a subset of rows (`ids.len()` must be
 /// a multiple of 16). Used to carve a small "draft" LM head out of the full one.
 pub fn gather_rows(data: &[u8], dt: DType, k: usize, ids: &[u32]) -> Vec<u8> {
@@ -305,10 +439,12 @@ pub fn gather_rows(data: &[u8], dt: DType, k: usize, ids: &[u32]) -> Vec<u8> {
             }
             out
         }
-        DType::Q8R | DType::Q4R => {
+        DType::Q8R | DType::Q4R | DType::Q6R => {
             let nb = k / BLOCK;
             let gb = dt.group_bytes(k);
-            let (qbytes, chunks) = if dt == DType::Q8R { (512, 8) } else { (256, 4) };
+            // every format stores its quants as 64-byte chunks of [row][4 bytes]
+            let qbytes = dt.block_qbytes();
+            let chunks = qbytes / 64;
             let mut out = vec![0u8; ids.len() / GROUP * gb];
             for (i, &r) in ids.iter().enumerate() {
                 let (sg, sl) = (r as usize / GROUP, r as usize % GROUP);
@@ -343,26 +479,17 @@ pub fn dequantize_row(data: &[u8], dt: DType, k: usize, row: usize, out: &mut [f
                 out[c] = f32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
             }
         }
-        DType::Q8R | DType::Q4R => {
+        DType::Q8R | DType::Q4R | DType::Q6R => {
             let nb = k / BLOCK;
             let g = row / GROUP;
             let r = row % GROUP;
             let gdata = &data[g * dt.group_bytes(k)..(g + 1) * dt.group_bytes(k)];
-            let qbytes = if dt == DType::Q8R { 512 } else { 256 };
-            let scales = &gdata[nb * qbytes..];
+            let scales = &gdata[nb * dt.block_qbytes()..];
             for b in 0..nb {
                 let so = (b * GROUP + r) * 2;
                 let d = f16::from_bits(u16::from_le_bytes([scales[so], scales[so + 1]])).to_f32();
                 for c in 0..BLOCK {
-                    let v = if dt == DType::Q8R {
-                        gdata[b * 512 + (c / 4) * 64 + r * 4 + c % 4] as i32 - 128
-                    } else {
-                        let (p, hi) = if c < 16 { (c / 4, false) } else { (c / 4 - 4, true) };
-                        let byte = gdata[b * 256 + p * 64 + r * 4 + c % 4];
-                        let nib = if hi { byte >> 4 } else { byte & 15 };
-                        IQ4NL[nib as usize] as i32
-                    };
-                    out[b * BLOCK + c] = d * v as f32;
+                    out[b * BLOCK + c] = d * qvalue(dt, gdata, b, r, c) as f32;
                 }
             }
         }
@@ -394,6 +521,11 @@ mod tests {
         rotate(&mut xr, b);
         assert!((dot(&w, &x) - dot(&wr, &xr)).abs() < 1e-4);
         assert!((dot(&w, &w) - dot(&wr, &wr)).abs() < 1e-4);
+        let mut back = wr.clone();
+        unrotate(&mut back, b);
+        for (p, q) in back.iter().zip(&w) {
+            assert!((p - q).abs() < 1e-5);
+        }
         // the SIMD path must match the scalar definition
         let mut a = x.clone();
         for (v, s) in a.iter_mut().zip(rot_signs()) {
@@ -411,7 +543,7 @@ mod tests {
     fn roundtrip_error_is_small() {
         let (rows, k) = (32, 128);
         let w = rand_mat(rows, k, 7);
-        for (dt, tol) in [(DType::Q8R, 0.01), (DType::Q4R, 0.12)] {
+        for (dt, tol) in [(DType::Q8R, 0.01), (DType::Q6R, 0.035), (DType::Q4R, 0.12)] {
             let q = quantize_matrix(&w, rows, k, dt, None);
             assert_eq!(q.len(), dt.matrix_bytes(rows, k));
             let mut row = vec![0f32; k];

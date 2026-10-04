@@ -109,6 +109,43 @@ impl Writer {
     }
 }
 
+/// Append (or replace) a raw tensor in an existing model file without
+/// rewriting the weights: the new bytes go where the old header was, followed
+/// by a new header and footer. The file must not be memory-mapped elsewhere.
+pub fn append_tensor(path: &Path, name: &str, dtype: DType, shape: &[usize], data: &[u8]) -> Result<()> {
+    use std::io::{Read, SeekFrom};
+    let mut f = std::fs::OpenOptions::new().read(true).write(true).open(path).with_context(|| format!("open {}", path.display()))?;
+    let n = f.metadata()?.len();
+    let mut footer = [0u8; 24];
+    f.seek(SeekFrom::Start(n - 24))?;
+    f.read_exact(&mut footer)?;
+    if &footer[16..] != MAGIC {
+        bail!("{} is not a ferrite model file", path.display());
+    }
+    let off = u64::from_le_bytes(footer[0..8].try_into().unwrap());
+    let len = u64::from_le_bytes(footer[8..16].try_into().unwrap()) as usize;
+    let mut hj = vec![0u8; len];
+    f.seek(SeekFrom::Start(off))?;
+    f.read_exact(&mut hj)?;
+    let mut header: Header = serde_json::from_slice(&hj)?;
+    header.tensors.retain(|t| t.name != name);
+    let pos = off.div_ceil(ALIGN) * ALIGN;
+    f.seek(SeekFrom::Start(off))?;
+    f.write_all(&vec![0u8; (pos - off) as usize])?;
+    f.write_all(data)?;
+    header.tensors.push(TensorInfo { name: name.into(), dtype, shape: shape.to_vec(), offset: pos, nbytes: data.len() as u64, rot: 0 });
+    let hpos = (pos + data.len() as u64).div_ceil(ALIGN) * ALIGN;
+    f.write_all(&vec![0u8; (hpos - pos - data.len() as u64) as usize])?;
+    let js = serde_json::to_vec(&header)?;
+    f.write_all(&js)?;
+    f.write_all(&hpos.to_le_bytes())?;
+    f.write_all(&(js.len() as u64).to_le_bytes())?;
+    f.write_all(MAGIC)?;
+    let end = f.stream_position()?;
+    f.set_len(end)?;
+    Ok(())
+}
+
 pub struct ModelFile {
     pub mmap: Mmap,
     pub header: Header,

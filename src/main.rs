@@ -95,9 +95,12 @@ enum Cmd {
         /// importance matrix (from `ferrite imatrix`) used for 4-bit quantization
         #[arg(long)]
         imatrix: Option<PathBuf>,
-        /// Hadamard-rotate weight matrices (much lower 4-bit error)
-        #[arg(long)]
+        /// force Hadamard rotation of weight matrices on (default: on for q8/q6)
+        #[arg(long, conflicts_with = "no_rotate")]
         rotate: bool,
+        /// force Hadamard rotation off
+        #[arg(long)]
+        no_rotate: bool,
     },
     /// Generate a completion for one prompt
     Run {
@@ -216,6 +219,17 @@ enum Cmd {
         #[arg(long, default_value_t = 8)]
         windows: usize,
     },
+    /// Rank tokens by frequency on a corpus and store the list in the model
+    /// (used to build the speculative-decoding draft head)
+    DraftVocab {
+        #[command(flatten)]
+        m: ModelArgs,
+        /// corpus files
+        #[arg(short, long, num_args = 1..)]
+        files: Vec<PathBuf>,
+        #[arg(long, default_value_t = 65536)]
+        keep: usize,
+    },
     /// Perplexity of a text file
     Ppl {
         #[command(flatten)]
@@ -234,7 +248,10 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Convert { hf, out, quant, imatrix, rotate } => ferrite::convert::convert(&hf, &out, &quant, imatrix.as_deref(), rotate),
+        Cmd::Convert { hf, out, quant, imatrix, rotate, no_rotate } => {
+            let rot = if rotate { Some(true) } else if no_rotate { Some(false) } else { None };
+            ferrite::convert::convert(&hf, &out, &quant, imatrix.as_deref(), rot)
+        }
         Cmd::Run { m, s, prompt, max_tokens, raw, think, system } => cmd_run(m, s, prompt, max_tokens, raw, think, system),
         Cmd::Chat { m, s, think, system, max_tokens } => cmd_chat(m, s, think, system, max_tokens),
         Cmd::Serve { m, host, port, max_tokens } => {
@@ -273,6 +290,31 @@ fn main() -> Result<()> {
         }
         Cmd::Ppl { m, file, window, windows } => cmd_ppl(m, file, window, windows),
         Cmd::Imatrix { m, file, out, chunks } => cmd_imatrix(m, file, out, chunks),
+        Cmd::DraftVocab { m, files, keep } => {
+            let mut counts: Vec<u64>;
+            {
+                let model = ferrite::model::Model::load(&m.model)?;
+                counts = vec![0; model.tokenizer.vocab_size()];
+                for f in &files {
+                    let text = std::fs::read_to_string(f)?;
+                    for id in model.tokenizer.encode(&text, false) {
+                        counts[id as usize] += 1;
+                    }
+                }
+            } // drop the mmap before rewriting the file
+            let mut ids: Vec<u32> = (0..counts.len() as u32).filter(|&i| counts[i as usize] > 0).collect();
+            ids.sort_by_key(|&i| (std::cmp::Reverse(counts[i as usize]), i));
+            let total: u64 = counts.iter().sum();
+            for n in [16384usize, 32768, 65536] {
+                let cov: u64 = ids.iter().take(n).map(|&i| counts[i as usize]).sum();
+                eprintln!("top {n:>6} tokens cover {:.2}% of the corpus", cov as f64 * 100.0 / total as f64);
+            }
+            ids.truncate(keep);
+            let bytes: Vec<u8> = ids.iter().flat_map(|i| i.to_le_bytes()).collect();
+            ferrite::format::append_tensor(&m.model, "draft_vocab", ferrite::quant::DType::U8, &[bytes.len()], &bytes)?;
+            println!("stored {} frequency-ranked token ids in {}", ids.len(), m.model.display());
+            Ok(())
+        }
         Cmd::Kld { m, reference, file, window, windows } => cmd_kld(m, reference, file, window, windows),
     }
 }
@@ -569,16 +611,23 @@ fn cmd_imatrix(m: ModelArgs, file: PathBuf, out: PathBuf, chunks: usize) -> Resu
     eprintln!();
     ferrite::kernels::IMATRIX_ON.store(false, Ordering::SeqCst);
     let g = ferrite::kernels::IMATRIX.lock().unwrap();
-    let mut res = std::collections::HashMap::new();
+    let (mut res, mut raw) = (std::collections::HashMap::new(), std::collections::HashMap::new());
     if let Some(map) = g.as_ref() {
-        for (&id, (sums, count)) in map {
+        for (&id, (sums, raw_sums, count)) in map {
             let name = e.model.file.header.tensors[id].name.clone();
-            res.insert(name, sums.iter().map(|s| (s / *count as f64) as f32).collect::<Vec<f32>>());
+            res.insert(name.clone(), sums.iter().map(|s| (s / *count as f64) as f32).collect::<Vec<f32>>());
+            raw.insert(name, raw_sums.iter().map(|s| (s / *count as f64) as f32).collect::<Vec<f32>>());
         }
     }
     let rotated = e.model.file.header.tensors.iter().any(|t| t.rot > 0);
     ferrite::imatrix::save(&out, &res, rotated)?;
     println!("saved importance matrix for {} tensors to {}", res.len(), out.display());
+    if rotated {
+        // unrotated statistics too, for formats that are better left unrotated (q4)
+        let raw_path = out.with_extension("raw.json");
+        ferrite::imatrix::save(&raw_path, &raw, false)?;
+        println!("saved unrotated importance matrix to {}", raw_path.display());
+    }
     Ok(())
 }
 

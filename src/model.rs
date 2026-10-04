@@ -437,6 +437,9 @@ impl Model {
     pub fn embed_row(&self, tok: u32, out: &mut [f32]) {
         let m = self.embed.as_ref().unwrap_or(&self.lm_head);
         m.dequantize_row(tok as usize, out);
+        if m.rot > 1 {
+            crate::quant::unrotate(out, m.rot);
+        }
     }
 
     /// Run the transformer over `tokens` (appending to `st`). On return

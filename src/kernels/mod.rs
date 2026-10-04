@@ -111,19 +111,24 @@ pub fn quantize_acts_into(pool: &ThreadPool, x: &[f32], t: usize, k: usize, rot:
 }
 
 /// Activation statistics collector for importance-matrix generation:
-/// per weight tensor id, the running sum of x^2 per input column and the row count.
-pub type ImatrixStats = std::collections::HashMap<usize, (Vec<f64>, u64)>;
+/// per weight tensor id, the running sums of x^2 per input column in the
+/// weights' own (possibly rotated) space and in the raw space, and the row count.
+pub type ImatrixStats = std::collections::HashMap<usize, (Vec<f64>, Vec<f64>, u64)>;
 pub static IMATRIX: std::sync::Mutex<Option<ImatrixStats>> = std::sync::Mutex::new(None);
 pub static IMATRIX_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn collect_imatrix(w: &QMat, x: &[f32], t: usize) {
     let mut g = IMATRIX.lock().unwrap();
     let map = g.get_or_insert_with(Default::default);
-    let e = map.entry(w.id).or_insert_with(|| (vec![0f64; w.k], 0));
+    let e = map.entry(w.id).or_insert_with(|| (vec![0f64; w.k], vec![0f64; w.k], 0));
     let mut tmp = vec![0f32; w.k];
     for tt in 0..t {
-        // statistics are collected in the space the weights live in (rotated or not)
-        tmp.copy_from_slice(&x[tt * w.k..(tt + 1) * w.k]);
+        let row = &x[tt * w.k..(tt + 1) * w.k];
+        for (c, v) in row.iter().enumerate() {
+            e.1[c] += (*v as f64) * (*v as f64);
+        }
+        // also in the space the weights live in (rotated or not)
+        tmp.copy_from_slice(row);
         if w.rot > 0 {
             crate::quant::rotate(&mut tmp, w.rot);
         }
@@ -131,7 +136,7 @@ fn collect_imatrix(w: &QMat, x: &[f32], t: usize) {
             e.0[c] += (*v as f64) * (*v as f64);
         }
     }
-    e.1 += t as u64;
+    e.2 += t as u64;
 }
 
 /// out[t, rows] = x[t, k] @ W^T. `qa` is scratch space for quantized activations.
@@ -143,7 +148,7 @@ pub fn matmul(pool: &ThreadPool, w: &QMat, x: &[f32], t: usize, out: &mut [f32],
     match w.dtype {
         DType::F32 => matmul_f32(pool, w, x, t, out),
         DType::U8 => panic!("U8 tensor used as a matrix"),
-        DType::Q8R | DType::Q4R => {
+        DType::Q8R | DType::Q4R | DType::Q6R => {
             quantize_acts_into(pool, x, t, w.k, w.rot, qa);
             matmul_q(pool, w, qa, out);
         }
@@ -232,7 +237,7 @@ mod tests {
                 want[tt * rows + r] = dot_f32(&w[r * k..(r + 1) * k], &x[tt * k..(tt + 1) * k]);
             }
         }
-        for dt in [DType::F32, DType::Q8R, DType::Q4R] {
+        for dt in [DType::F32, DType::Q8R, DType::Q6R, DType::Q4R] {
             let data = quantize_matrix(&w, rows, k, dt, None);
             let m = QMat { dtype: dt, rows, k, ptr: data.as_ptr(), len: data.len(), id: usize::MAX, rot: 0 };
             // dequantized reference: isolates kernel bugs from quantization error

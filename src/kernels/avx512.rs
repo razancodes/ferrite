@@ -154,6 +154,66 @@ unsafe fn tile_q4r<const NT: usize>(
     }
 }
 
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni")]
+unsafe fn tile_q6r<const NT: usize>(
+    gq: *const u8,
+    gs: *const u8,
+    nb: usize,
+    xq: *const i8,
+    k: usize,
+    xd: *const f32,
+    xm: *const f32,
+    out: *mut f32,
+    ldo: usize,
+) {
+    unsafe {
+        let m4 = _mm512_set1_epi8(0x0F);
+        let m30 = _mm512_set1_epi8(0x30);
+        let c96 = _mm512_set1_epi8(96); // u6 + 96 = value + 128
+        let mut acc = [_mm512_setzero_ps(); NT];
+        for b in 0..nb {
+            let dw = _mm512_cvtph_ps(_mm256_loadu_si256(gs.add(b * 32) as *const __m256i));
+            let qb = gq.add(b * 384);
+            let xb = xq.add(b * 32);
+            let mut ia = [_mm512_setzero_si512(); NT];
+            let mut ib = [_mm512_setzero_si512(); NT];
+            for h in 0..2 {
+                let hv = _mm512_loadu_si512(qb.add(256 + h * 64) as *const _);
+                for jj in 0..4 {
+                    let j = 4 * h + jj;
+                    let lov = _mm512_loadu_si512(qb.add((j % 4) * 64) as *const _);
+                    let lo = if j < 4 { _mm512_and_si512(lov, m4) } else { _mm512_and_si512(_mm512_srli_epi16::<4>(lov), m4) };
+                    let hb = match jj {
+                        0 => _mm512_slli_epi16::<4>(hv),
+                        1 => _mm512_slli_epi16::<2>(hv),
+                        2 => hv,
+                        _ => _mm512_srli_epi16::<2>(hv),
+                    };
+                    let wv = _mm512_add_epi8(_mm512_or_si512(lo, _mm512_and_si512(hb, m30)), c96);
+                    for t in 0..NT {
+                        if jj % 2 == 0 {
+                            ia[t] = _mm512_dpbusd_epi32(ia[t], wv, bcast4(xb.add(t * k + j * 4)));
+                        } else {
+                            ib[t] = _mm512_dpbusd_epi32(ib[t], wv, bcast4(xb.add(t * k + j * 4)));
+                        }
+                    }
+                }
+            }
+            for t in 0..NT {
+                let s = _mm512_fmsub_ps(
+                    _mm512_cvtepi32_ps(_mm512_add_epi32(ia[t], ib[t])),
+                    _mm512_set1_ps(*xd.add(t * nb + b)),
+                    _mm512_set1_ps(*xm.add(t * nb + b)),
+                );
+                acc[t] = _mm512_fmadd_ps(s, dw, acc[t]);
+            }
+        }
+        for t in 0..NT {
+            _mm512_storeu_ps(out.add(t * ldo), acc[t]);
+        }
+    }
+}
+
 type TileFn = unsafe fn(*const u8, *const u8, usize, *const i8, usize, *const f32, *const f32, *mut f32, usize);
 
 fn tiles(dt: DType) -> [TileFn; 9] {
@@ -165,6 +225,7 @@ fn tiles(dt: DType) -> [TileFn; 9] {
     match dt {
         DType::Q8R => t!(tile_q8r),
         DType::Q4R => t!(tile_q4r),
+        DType::Q6R => t!(tile_q6r),
         DType::F32 | DType::U8 => unreachable!(),
     }
 }
@@ -174,7 +235,7 @@ pub unsafe fn gemm(w: &QMat, qa: &QActs, glo: usize, ghi: usize, out: *mut f32) 
     let k = w.k;
     let nb = k / BLOCK;
     let gb = w.dtype.group_bytes(k);
-    let qbytes = if w.dtype == DType::Q8R { 512 } else { 256 };
+    let qbytes = w.dtype.block_qbytes();
     let tf = tiles(w.dtype);
     let tt = qa.t;
     // Block tokens so the activation slice stays L2-resident while the weight
