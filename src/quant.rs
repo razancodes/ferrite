@@ -74,6 +74,74 @@ impl DType {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Randomized Hadamard rotation ("incoherence processing", as in QuIP#/QuaRot).
+//
+// Weight rows and activations are both transformed by R = H_b * D (D: fixed
+// pseudo-random signs, H_b: orthonormal Walsh-Hadamard on blocks of b columns).
+// Since R is orthogonal, (W R^T)(R x) = W x, but outlier weights get spread
+// across their block, so 4-bit rounding error drops sharply. R^T = D H_b, and
+// D H_b applied to a weight row equals R applied to it because H_b is symmetric,
+// so the very same transform is used on both sides.
+
+/// Rotation block size for a reduction dimension k (largest power of two <= 256 dividing k).
+pub fn rot_block(k: usize) -> usize {
+    let mut b = 256;
+    while b > 1 && !k.is_multiple_of(b) {
+        b /= 2;
+    }
+    b
+}
+
+fn rot_signs() -> &'static [f32] {
+    static SIGNS: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+    SIGNS.get_or_init(|| {
+        (0..65536u64)
+            .map(|c| {
+                let mut z = c.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                if (z ^ (z >> 31)) & 1 == 1 { -1.0 } else { 1.0 }
+            })
+            .collect()
+    })
+}
+
+/// In-place normalized fast Walsh-Hadamard transform (len must be a power of two).
+pub fn fwht(x: &mut [f32]) {
+    let n = x.len();
+    let mut len = 1;
+    while len < n {
+        for i in (0..n).step_by(2 * len) {
+            let (a, b) = x[i..i + 2 * len].split_at_mut(len);
+            for j in 0..len {
+                let (u, v) = (a[j], b[j]);
+                a[j] = u + v;
+                b[j] = u - v;
+            }
+        }
+        len *= 2;
+    }
+    let s = 1.0 / (n as f32).sqrt();
+    x.iter_mut().for_each(|v| *v *= s);
+}
+
+/// x <- H_b D x for a vector of length k (block b).
+pub fn rotate(x: &mut [f32], b: usize) {
+    let signs = rot_signs();
+    assert!(x.len() <= signs.len());
+    if b == 256 && crate::kernels::isa() == crate::kernels::Isa::Avx512Vnni {
+        unsafe { crate::kernels::vmath::rotate256(x, signs) };
+        return;
+    }
+    for (v, s) in x.iter_mut().zip(signs) {
+        *v *= s;
+    }
+    for blk in x.chunks_exact_mut(b) {
+        fwht(blk);
+    }
+}
+
 /// Quantize a row-major f32 matrix [rows, k] into `dt` (rows % 16 == 0, k % 32 == 0).
 /// `importance` (length k) optionally weights the per-column error (from an imatrix).
 pub fn quantize_matrix(w: &[f32], rows: usize, k: usize, dt: DType, importance: Option<&[f32]>) -> Vec<u8> {
@@ -313,6 +381,32 @@ mod tests {
             })
             .collect()
     }
+    #[test]
+    fn rotation_is_orthogonal() {
+        let k = 768;
+        let b = rot_block(k);
+        assert_eq!(b, 256);
+        let w = rand_mat(1, k, 3);
+        let x = rand_mat(1, k, 4);
+        let dot = |a: &[f32], c: &[f32]| a.iter().zip(c).map(|(p, q)| p * q).sum::<f32>();
+        let (mut wr, mut xr) = (w.clone(), x.clone());
+        rotate(&mut wr, b);
+        rotate(&mut xr, b);
+        assert!((dot(&w, &x) - dot(&wr, &xr)).abs() < 1e-4);
+        assert!((dot(&w, &w) - dot(&wr, &wr)).abs() < 1e-4);
+        // the SIMD path must match the scalar definition
+        let mut a = x.clone();
+        for (v, s) in a.iter_mut().zip(rot_signs()) {
+            *v *= s;
+        }
+        for blk in a.chunks_exact_mut(256) {
+            fwht(blk);
+        }
+        for (p, q) in a.iter().zip(&xr) {
+            assert!((p - q).abs() < 1e-5, "simd rotate mismatch {p} vs {q}");
+        }
+    }
+
     #[test]
     fn roundtrip_error_is_small() {
         let (rows, k) = (32, 128);

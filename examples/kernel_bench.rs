@@ -41,7 +41,7 @@ fn main() {
     let w: Vec<f32> = (0..rows * k).map(|i| ((i * 7919) % 1000) as f32 / 1000.0 - 0.5).collect();
     for dt in [DType::Q8R, DType::Q4R] {
         let data = quantize_matrix(&w, rows, k, dt, None);
-        let m = QMat { dtype: dt, rows, k, ptr: data.as_ptr(), len: data.len(), id: usize::MAX };
+        let m = QMat { dtype: dt, rows, k, ptr: data.as_ptr(), len: data.len(), id: usize::MAX, rot: 0 };
         for (threads, t) in [(1usize, 1usize), (4, 1), (1, 64), (4, 256)] {
             let pool = ThreadPool::new(threads);
             let x: Vec<f32> = (0..t * k).map(|i| ((i * 31) % 97) as f32 / 97.0 - 0.5).collect();

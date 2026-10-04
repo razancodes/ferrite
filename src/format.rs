@@ -29,6 +29,9 @@ pub struct TensorInfo {
     pub shape: Vec<usize>,
     pub offset: u64,
     pub nbytes: u64,
+    /// Hadamard rotation block applied to the input dimension (0 = none)
+    #[serde(default)]
+    pub rot: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -72,10 +75,18 @@ impl Writer {
             shape: shape.to_vec(),
             offset: self.pos,
             nbytes: data.len() as u64,
+            rot: 0,
         });
         self.f.write_all(data)?;
         self.pos += data.len() as u64;
         Ok(())
+    }
+
+    /// Mark the most recently added tensor as Hadamard-rotated with block `b`.
+    pub fn set_rot(&mut self, b: usize) {
+        if let Some(t) = self.tensors.last_mut() {
+            t.rot = b;
+        }
     }
 
     pub fn add_f32(&mut self, name: &str, data: &[f32]) -> Result<()> {

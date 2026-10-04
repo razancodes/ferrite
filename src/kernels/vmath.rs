@@ -151,7 +151,19 @@ pub unsafe fn exp_sub_sum(x: &mut [f32], m: f32) -> f32 {
 /// Reads the state from `src` and writes the updated state to `dst` (they may
 /// alias). Writing to a different buffer is how speculative decoding keeps a
 /// rollback checkpoint without any extra memory traffic.
-pub unsafe fn delta_rule_step_128(src: *const f32, dst: *mut f32, q: &[f32], k: &[f32], v: &[f32], beta: f32, decay: f32, o: &mut [f32]) {
+/// If `dlt` is non-null the 128 delta values are stored there (replay log).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn delta_rule_step_128(
+    src: *const f32,
+    dst: *mut f32,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    beta: f32,
+    decay: f32,
+    o: &mut [f32],
+    dlt: *mut f32,
+) {
     const DV: usize = 128;
     let dk = k.len();
     unsafe {
@@ -169,6 +181,9 @@ pub unsafe fn delta_rule_step_128(src: *const f32, dst: *mut f32, q: &[f32], k: 
         for c in 0..8 {
             let vv = _mm512_loadu_ps(v.as_ptr().add(16 * c));
             delta[c] = _mm512_mul_ps(vb, _mm512_fnmadd_ps(vd, acc[c], vv));
+            if !dlt.is_null() {
+                _mm512_storeu_ps(dlt.add(16 * c), delta[c]);
+            }
         }
         let mut out = [_mm512_setzero_ps(); 8];
         for i in 0..dk {
@@ -214,7 +229,8 @@ mod tests {
 /// `rows` points at token 0 of the projection (stride `stride`), conv inputs are
 /// replaced in place by outputs; `state` is [3][cd] (oldest first) and updated.
 #[target_feature(enable = "avx512f")]
-/// If `ck` is non-null, the state after token `ck_tok` is also written there.
+/// The state after token j is also written to `cks[j]` for j < cks.len()
+/// (speculative-decoding checkpoints).
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn conv4_silu(
     rows: *mut f32,
@@ -225,8 +241,7 @@ pub unsafe fn conv4_silu(
     cd: usize,
     lo: usize,
     hi: usize,
-    ck: *mut f32,
-    ck_tok: usize,
+    cks: &[*mut f32],
 ) {
     unsafe {
         let mut ch = lo;
@@ -247,7 +262,7 @@ pub unsafe fn conv4_silu(
                 s0 = s1;
                 s1 = s2;
                 s2 = x;
-                if tok == ck_tok && !ck.is_null() {
+                if let Some(&ck) = cks.get(tok) {
                     st(ck.add(ch), s0, rem);
                     st(ck.add(cd + ch), s1, rem);
                     st(ck.add(2 * cd + ch), s2, rem);
@@ -281,5 +296,81 @@ pub unsafe fn sum_sq(x: &[f32]) -> f32 {
             i += 16;
         }
         _mm512_reduce_add_ps(_mm512_add_ps(a0, a1))
+    }
+}
+
+/// Randomized Hadamard rotation of 256-element blocks (see `quant::rotate`):
+/// sign flip, then a normalized Walsh-Hadamard transform held entirely in 16
+/// zmm registers. Stages within a register use lane permutes; stages across
+/// registers are plain add/sub.
+#[target_feature(enable = "avx512f")]
+pub unsafe fn rotate256(x: &mut [f32], signs: &[f32]) {
+    debug_assert!(x.len().is_multiple_of(256) && signs.len() >= x.len());
+    unsafe {
+        let lane = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        let scale = _mm512_set1_ps(1.0 / 16.0);
+        for blk in 0..x.len() / 256 {
+            let p = x.as_mut_ptr().add(blk * 256);
+            let s = signs.as_ptr().add(blk * 256);
+            let mut v = [_mm512_setzero_ps(); 16];
+            for i in 0..16 {
+                v[i] = _mm512_mul_ps(_mm512_loadu_ps(p.add(16 * i)), _mm512_loadu_ps(s.add(16 * i)));
+            }
+            // within-register butterflies: partner lane = lane ^ len
+            for len in [1, 2, 4, 8] {
+                let idx = _mm512_xor_si512(lane, _mm512_set1_epi32(len));
+                let hi = _mm512_test_epi32_mask(lane, _mm512_set1_epi32(len)); // lanes with bit set take (partner - x)
+                for vi in v.iter_mut() {
+                    let pv = _mm512_permutexvar_ps(idx, *vi);
+                    let sum = _mm512_add_ps(*vi, pv);
+                    let dif = _mm512_sub_ps(pv, *vi);
+                    *vi = _mm512_mask_blend_ps(hi, sum, dif);
+                }
+            }
+            // across registers
+            let mut step = 1;
+            while step < 16 {
+                for i in 0..16 {
+                    if i & step == 0 {
+                        let (a, b) = (v[i], v[i + step]);
+                        v[i] = _mm512_add_ps(a, b);
+                        v[i + step] = _mm512_sub_ps(a, b);
+                    }
+                }
+                step *= 2;
+            }
+            for i in 0..16 {
+                _mm512_storeu_ps(p.add(16 * i), _mm512_mul_ps(v[i], scale));
+            }
+        }
+    }
+}
+
+/// Re-apply logged delta-rule updates: dst = replay of `n` tokens on top of
+/// `s0` (one head, d_v = 128). Each log entry is [k (dk) | delta (128) | decay]
+/// with stride `stride`. Uses exactly the forward pass's fused operations, so the
+/// result is bitwise identical to the state the forward pass produced.
+#[target_feature(enable = "avx512f")]
+pub unsafe fn delta_replay_128(s0: *const f32, dst: *mut f32, dk: usize, log: *const f32, stride: usize, n: usize) {
+    const DV: usize = 128;
+    unsafe {
+        for i in 0..dk {
+            let mut sv = [_mm512_setzero_ps(); 8];
+            for c in 0..8 {
+                sv[c] = _mm512_loadu_ps(s0.add(i * DV + 16 * c));
+            }
+            for t in 0..n {
+                let e = log.add(t * stride);
+                let ki = _mm512_set1_ps(*e.add(i));
+                let vd = _mm512_set1_ps(*e.add(dk + DV));
+                for c in 0..8 {
+                    let d = _mm512_loadu_ps(e.add(dk + 16 * c));
+                    sv[c] = _mm512_fmadd_ps(sv[c], vd, _mm512_mul_ps(ki, d));
+                }
+            }
+            for c in 0..8 {
+                _mm512_storeu_ps(dst.add(i * DV + 16 * c), sv[c]);
+            }
+        }
     }
 }

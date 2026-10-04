@@ -94,9 +94,13 @@ pub struct State {
     pub ssm: Vec<Vec<f32>>,
     /// token history (everything processed so far)
     pub tokens: Vec<u32>,
-    /// DeltaNet/conv states captured mid-batch (speculative-decoding rollback)
-    pub ckpt_conv: Vec<Vec<f32>>,
-    pub ckpt_ssm: Vec<Vec<f32>>,
+    /// Speculative-decoding rollback support for the last checkpointed batch:
+    /// `ckpt_conv[c][layer]` is the conv state after token c; `ssm_alt[layer]`
+    /// holds the DeltaNet state from *before* the batch and `replay[layer]` the
+    /// per-token rank-1 updates, so any intermediate state can be rebuilt.
+    pub ckpt_conv: Vec<Vec<Vec<f32>>>,
+    pub ssm_alt: Vec<Vec<f32>>,
+    pub replay: Vec<Vec<f32>>,
     /// MTP head: KV cache, number of positions it has processed, and the main
     /// model's final-normed hidden states for positions [mtp_pos, pos)
     pub mtp_k: Vec<u16>,
@@ -145,6 +149,7 @@ impl Model {
                 ptr: b.as_ptr(),
                 len: b.len(),
                 id: file.index_of(name).unwrap_or(usize::MAX),
+                rot: t.rot,
             })
         };
         let vecf = |name: &str| -> Result<FSlice> {
@@ -284,8 +289,9 @@ impl Model {
             conv: (0..nl).map(|_| vec![0f32; conv_n]).collect(),
             ssm: (0..nl).map(|_| vec![0f32; ssm_n]).collect(),
             tokens: Vec::new(),
-            ckpt_conv: (0..nl).map(|_| vec![0f32; conv_n]).collect(),
-            ckpt_ssm: (0..nl).map(|_| vec![0f32; ssm_n]).collect(),
+            ckpt_conv: Vec::new(),
+            ssm_alt: Vec::new(),
+            replay: Vec::new(),
             mtp_k: vec![0u16; mtp_kv],
             mtp_v: vec![0u16; mtp_kv],
             mtp_pos: 0,
@@ -312,17 +318,68 @@ impl Model {
         ids.truncate(n - extra.len());
         ids.append(&mut extra);
         let buf = crate::quant::gather_rows(self.lm_head.bytes(), self.lm_head.dtype, self.lm_head.k, &ids);
-        let mat = QMat { dtype: self.lm_head.dtype, rows: ids.len(), k: self.lm_head.k, ptr: buf.as_ptr(), len: buf.len(), id: usize::MAX };
+        let mat = QMat {
+            dtype: self.lm_head.dtype,
+            rows: ids.len(),
+            k: self.lm_head.k,
+            ptr: buf.as_ptr(),
+            len: buf.len(),
+            id: usize::MAX,
+            rot: self.lm_head.rot,
+        };
         self.draft = Some(DraftHead { mat, ids, _buf: buf });
         Ok(())
     }
 
-    /// Undo the last token(s) of a forward pass that was run with a checkpoint:
-    /// the recurrent states return to the checkpoint and the sequence to `pos`.
-    pub fn rollback(&self, st: &mut State, pos: usize) {
+    /// Allocate rollback buffers for batches with `n` checkpoints.
+    pub fn ensure_ckpts(&self, st: &mut State, n: usize) {
+        while st.ckpt_conv.len() < n {
+            st.ckpt_conv.push(st.conv.iter().map(|v| vec![0f32; v.len()]).collect());
+        }
+        if n > 0 && st.ssm_alt.is_empty() {
+            st.ssm_alt = st.ssm.iter().map(|v| vec![0f32; v.len()]).collect();
+            st.replay = st.ssm.iter().map(|_| Vec::new()).collect();
+        }
+    }
+
+    fn replay_stride(&self) -> usize {
+        self.cfg.lin_k_dim + self.cfg.lin_v_dim + 1
+    }
+
+    /// Undo the tail of a forward pass run with checkpoints: the sequence goes
+    /// back to `pos` and the recurrent states to "after token c" of that batch.
+    /// Conv states are swapped in; DeltaNet states are rebuilt by replaying the
+    /// logged rank-1 updates of tokens 0..=c on top of the pre-batch state
+    /// (one read + one write of the state, bitwise identical to the forward pass).
+    pub fn rollback(&self, pool: &ThreadPool, st: &mut State, pos: usize, c: usize) {
+        let cfg = &self.cfg;
+        let (nv, dk, dv) = (cfg.lin_v_heads, cfg.lin_k_dim, cfg.lin_v_dim);
+        let stride = self.replay_stride();
+        let fast = dv == 128 && crate::kernels::isa() == crate::kernels::Isa::Avx512Vnni;
         for i in 0..st.conv.len() {
-            std::mem::swap(&mut st.conv[i], &mut st.ckpt_conv[i]);
-            std::mem::swap(&mut st.ssm[i], &mut st.ckpt_ssm[i]);
+            std::mem::swap(&mut st.conv[i], &mut st.ckpt_conv[c][i]);
+            let dst = SyncPtr::new(&mut st.ssm[i]);
+            let s0 = &st.ssm_alt[i];
+            let log = &st.replay[i];
+            pool.par_tasks(nv, |hd| {
+                let base = hd * dk * dv;
+                // log layout: [token][head][entry]
+                let entry0 = unsafe { log.as_ptr().add(hd * stride) };
+                if fast {
+                    unsafe { crate::kernels::vmath::delta_replay_128(s0.as_ptr().add(base), dst.get().add(base), dk, entry0, nv * stride, c + 1) };
+                } else {
+                    for ii in 0..dk {
+                        for j in 0..dv {
+                            let mut x = s0[base + ii * dv + j];
+                            for t in 0..=c {
+                                let e = &log[(t * nv + hd) * stride..(t * nv + hd + 1) * stride];
+                                x = e[dk + dv] * x + e[ii] * e[dk + j];
+                            }
+                            unsafe { *dst.get().add(base + ii * dv + j) = x };
+                        }
+                    }
+                }
+            });
         }
         st.pos = pos;
         st.tokens.truncate(pos);
@@ -385,13 +442,15 @@ impl Model {
     /// Run the transformer over `tokens` (appending to `st`). On return
     /// `sc.x[..t*hidden]` holds the final hidden states *before* the final norm.
     pub fn forward(&self, pool: &ThreadPool, st: &mut State, sc: &mut Scratch, tokens: &[u32]) -> Result<()> {
-        self.forward_ckpt(pool, st, sc, tokens, None)
+        self.forward_ckpt(pool, st, sc, tokens, 0)
     }
 
-    /// Like `forward`; with `ckpt = Some(c)` the recurrent state after token
-    /// index `c` is captured so `rollback` can undo the tokens after it.
-    pub fn forward_ckpt(&self, pool: &ThreadPool, st: &mut State, sc: &mut Scratch, tokens: &[u32], ckpt: Option<usize>) -> Result<()> {
+    /// Like `forward`, additionally capturing the recurrent state after each of
+    /// the first `nckpt` tokens so `rollback` can undo the tokens after them.
+    pub fn forward_ckpt(&self, pool: &ThreadPool, st: &mut State, sc: &mut Scratch, tokens: &[u32], nckpt: usize) -> Result<()> {
         let t = tokens.len();
+        let ckpt = nckpt.min(t);
+        self.ensure_ckpts(st, ckpt);
         if t == 0 {
             return Ok(());
         }
@@ -424,7 +483,7 @@ impl Model {
         sc: &mut Scratch,
         t: usize,
         pos0: usize,
-        ckpt: Option<usize>,
+        ckpt: usize,
     ) -> Result<()> {
         let h = self.cfg.hidden;
         let eps = self.cfg.rms_eps;
@@ -489,7 +548,7 @@ impl Model {
 
     /// Gated DeltaNet token mixer. Leaves its output in `sc.mix`.
     #[allow(clippy::too_many_arguments)]
-    fn deltanet(&self, pool: &ThreadPool, lw: &LinearW, slot: usize, st: &mut State, sc: &mut Scratch, t: usize, ckpt: Option<usize>) {
+    fn deltanet(&self, pool: &ThreadPool, lw: &LinearW, slot: usize, st: &mut State, sc: &mut Scratch, t: usize, ckpt: usize) {
         let c = &self.cfg;
         let (nk, nv, dk, dv) = (c.lin_k_heads, c.lin_v_heads, c.lin_k_dim, c.lin_v_dim);
         let kd = nk * dk;
@@ -504,7 +563,7 @@ impl Model {
             matmul(pool, &lw.in_proj, &sc.xn, t, &mut sc.proj, &mut sc.qa);
         }
         let _p = scope("dn.in_ba");
-        if lw.in_ba.dtype != DType::F32 && lw.in_proj.dtype != DType::F32 {
+        if lw.in_ba.dtype != DType::F32 && lw.in_proj.dtype != DType::F32 && lw.in_ba.rot == lw.in_proj.rot {
             matmul_q(pool, &lw.in_ba, &sc.qa, &mut sc.ba);
         } else {
             matmul(pool, &lw.in_ba, &sc.xn, t, &mut sc.ba, &mut sc.qa);
@@ -517,13 +576,12 @@ impl Model {
             let conv_w = lw.conv_w;
             let pp = SyncPtr::new(&mut sc.proj);
             let sp = SyncPtr::new(&mut st.conv[slot]);
-            let ckp = SyncPtr::new(&mut st.ckpt_conv[slot]);
-            let ck_tok = ckpt.unwrap_or(usize::MAX);
+            let ckps: Vec<SyncPtr<f32>> = (0..ckpt).map(|c| SyncPtr::new(&mut st.ckpt_conv[c][slot])).collect();
             let fast = kk == 4 && crate::kernels::isa() == crate::kernels::Isa::Avx512Vnni;
             pool.par_chunks(cd, 64, |lo, hi| {
-                let ck = if ckpt.is_some() { ckp.get() } else { std::ptr::null_mut() };
                 if fast {
-                    unsafe { crate::kernels::vmath::conv4_silu(pp.get(), rows, t, conv_w, sp.get(), cd, lo, hi, ck, ck_tok) };
+                    let cks: Vec<*mut f32> = ckps.iter().map(|p| p.get()).collect();
+                    unsafe { crate::kernels::vmath::conv4_silu(pp.get(), rows, t, conv_w, sp.get(), cd, lo, hi, &cks) };
                     return;
                 }
                 let state = unsafe { sp.slice(0, (kk - 1) * cd) };
@@ -542,7 +600,7 @@ impl Model {
                         row[ch] = y;
                     }
                     ops::silu_inplace(&mut row[lo..hi]);
-                    if tok == ck_tok {
+                    if let Some(ckp) = ckps.get(tok) {
                         let ckst = unsafe { ckp.slice(0, (kk - 1) * cd) };
                         for j in 0..kk - 1 {
                             ckst[j * cd + lo..j * cd + hi].copy_from_slice(&state[j * cd + lo..j * cd + hi]);
@@ -560,7 +618,15 @@ impl Model {
             let ba = &sc.ba;
             let nba = lw.in_ba.rows;
             let ssm = SyncPtr::new(&mut st.ssm[slot]);
-            let cks = SyncPtr::new(&mut st.ckpt_ssm[slot]);
+            // checkpointed batch: the state streams main -> alt once (kept in L2
+            // between tokens) and each token's update is logged for rollback
+            let stride = self.replay_stride();
+            let (alt, log) = if ckpt > 0 {
+                st.replay[slot].resize(t * nv * stride, 0.0);
+                (SyncPtr::new(&mut st.ssm_alt[slot]), SyncPtr::new(&mut st.replay[slot]))
+            } else {
+                (SyncPtr(std::ptr::null_mut()), SyncPtr(std::ptr::null_mut()))
+            };
             let core = SyncPtr::new(&mut sc.core);
             let scale = 1.0 / (dk as f32).sqrt();
             let ratio = nv / nk;
@@ -569,7 +635,7 @@ impl Model {
             pool.par_tasks(nv, |hd| {
                 let kh = hd / ratio;
                 let main = unsafe { ssm.get().add(hd * dk * dv) };
-                let ckb = unsafe { cks.get().add(hd * dk * dv) };
+                let altp = if ckpt > 0 { unsafe { alt.get().add(hd * dk * dv) } } else { main };
                 let mut q = vec![0f32; dk];
                 let mut k = vec![0f32; dk];
                 let mut kv = vec![0f32; dv];
@@ -587,17 +653,23 @@ impl Model {
                     let beta = sigmoid(ba[tok * nba + hd]);
                     let g = lw.neg_a[hd] * softplus(ba[tok * nba + nv + hd] + lw.dt_bias[hd]);
                     let decay = g.exp();
-                    // token c writes the checkpoint buffer, token c+1 reads it back:
-                    // the checkpoint costs no extra state traffic
-                    let (src, dst) = match ckpt {
-                        Some(c) if tok == c => (main as *const f32, ckb),
-                        Some(c) if tok == c + 1 => (ckb as *const f32, main),
-                        _ => (main as *const f32, main),
-                    };
+                    let src = if tok == 0 { main as *const f32 } else { altp as *const f32 };
+                    let dst = altp;
+                    let entry = if ckpt > 0 { unsafe { log.get().add((tok * nv + hd) * stride) } } else { std::ptr::null_mut() };
+                    if !entry.is_null() {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(k.as_ptr(), entry, dk);
+                            *entry.add(dk + dv) = decay;
+                        }
+                    }
                     if dv == 128 && fast {
-                        unsafe { crate::kernels::vmath::delta_rule_step_128(src, dst, &q, &k, v, beta, decay, &mut o) };
+                        let dl = if entry.is_null() { entry } else { unsafe { entry.add(dk) } };
+                        unsafe { crate::kernels::vmath::delta_rule_step_128(src, dst, &q, &k, v, beta, decay, &mut o, dl) };
                     } else {
                         unsafe { delta_rule_step(src, dst, &q, &k, v, beta, decay, &mut kv, &mut o, dk, dv) };
+                        if !entry.is_null() {
+                            unsafe { std::ptr::copy_nonoverlapping(kv.as_ptr(), entry.add(dk), dv) };
+                        }
                     }
                     // gated RMSNorm: rmsnorm(o) * w * silu(z)
                     let z = &row[cd + hd * dv..cd + (hd + 1) * dv];
@@ -605,11 +677,11 @@ impl Model {
                     rmsnorm(&o, lw.gnorm, eps, out);
                     ops::mul_silu(out, z);
                 }
-                if ckpt == Some(t - 1) {
-                    // checkpoint after the last token: the live state must hold it too
-                    unsafe { std::ptr::copy_nonoverlapping(ckb as *const f32, main, dk * dv) };
-                }
             });
+            if ckpt > 0 {
+                // live state = after the batch; alt keeps the pre-batch state for replay
+                std::mem::swap(&mut st.ssm[slot], &mut st.ssm_alt[slot]);
+            }
         }
         resize(&mut sc.mix, t * c.hidden);
         let _p = scope("dn.out_proj");

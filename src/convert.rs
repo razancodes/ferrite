@@ -70,7 +70,10 @@ struct Ctx<'a> {
     total_params: usize,
     total_bytes: usize,
     imatrix: Option<HashMap<String, Vec<f32>>>,
+    /// imatrix statistics were collected in rotated space
+    imatrix_rotated: bool,
     recipe: Recipe,
+    rotate: bool,
 }
 
 impl Ctx<'_> {
@@ -79,22 +82,61 @@ impl Ctx<'_> {
         Ok((t.to_f32(), t.shape.clone()))
     }
 
-    fn matrix(&mut self, out_name: &str, rows: &[Vec<f32>], k: usize) -> Result<()> {
+    /// Quantize and write a matrix built by stacking `parts` (each [rows_i, k]).
+    /// Takes ownership so a single part is used without copying (the f32
+    /// embedding of a 4B model alone is 2.5 GB).
+    fn matrix(&mut self, out_name: &str, mut parts: Vec<Vec<f32>>, k: usize) -> Result<()> {
         let dt = self.recipe.dtype_for(out_name);
-        let nrows: usize = rows.iter().map(|r| r.len() / k).sum();
-        let mut w = Vec::with_capacity(nrows * k);
-        for r in rows {
-            assert_eq!(r.len() % k, 0);
-            w.extend_from_slice(r);
+        for p in &parts {
+            assert_eq!(p.len() % k, 0);
+        }
+        let w = if parts.len() == 1 {
+            parts.pop().unwrap()
+        } else {
+            let mut w = Vec::with_capacity(parts.iter().map(|p| p.len()).sum());
+            for p in parts.drain(..) {
+                w.extend_from_slice(&p);
+            }
+            w
+        };
+        let nrows = w.len() / k;
+        let mut w = w;
+        // Hadamard-rotate the input dimension of every matrix except the tied
+        // embedding / LM head (its rows are also looked up as embeddings)
+        let rot = if self.rotate && dt != DType::F32 && out_name != "lm_head" && out_name != "embed" {
+            crate::quant::rot_block(k)
+        } else {
+            0
+        };
+        if rot > 1 {
+            for row in w.chunks_exact_mut(k) {
+                crate::quant::rotate(row, rot);
+            }
         }
         if !nrows.is_multiple_of(16) {
             bail!("{out_name}: {nrows} rows is not a multiple of 16");
         }
-        let imp = self.imatrix.as_ref().and_then(|m| m.get(out_name)).map(|v| v.as_slice());
-        let q = quantize_matrix(&w, nrows, k, dt, imp);
+        let mut imp: Option<Vec<f32>> = self.imatrix.as_ref().and_then(|m| m.get(out_name)).cloned();
+        if let Some(v) = imp.as_mut() {
+            if rot > 1 && !self.imatrix_rotated {
+                // stats from an unrotated model: in rotated space each column of a
+                // block sees (in expectation) the block's mean activation energy
+                for blk in v.chunks_exact_mut(rot) {
+                    let m = blk.iter().sum::<f32>() / rot as f32;
+                    blk.iter_mut().for_each(|x| *x = m);
+                }
+            } else if rot <= 1 && self.imatrix_rotated {
+                imp = None; // rotated stats do not apply to an unrotated matrix
+            }
+        }
+        let q = quantize_matrix(&w, nrows, k, dt, imp.as_deref());
         self.total_params += nrows * k;
         self.total_bytes += q.len();
-        self.w.add(out_name, dt, &[nrows, k], &q)
+        self.w.add(out_name, dt, &[nrows, k], &q)?;
+        if rot > 1 {
+            self.w.set_rot(rot);
+        }
+        Ok(())
     }
 
     fn vector(&mut self, out_name: &str, v: &[f32]) -> Result<()> {
@@ -136,22 +178,22 @@ fn convert_attention(cx: &mut Ctx, cfg: &Config, src: &str, dst: &str, offset: b
     }
     parts.push(k);
     parts.push(v);
-    cx.matrix(&format!("{dst}.qkv"), &parts, h)?;
+    cx.matrix(&format!("{dst}.qkv"), parts, h)?;
     cx.norm(&format!("{dst}.q_norm"), &format!("{src}.q_norm.weight"), offset)?;
     cx.norm(&format!("{dst}.k_norm"), &format!("{src}.k_norm.weight"), offset)?;
     let (o, _) = cx.load(&format!("{src}.o_proj.weight"))?;
-    cx.matrix(&format!("{dst}.o_proj"), &[o], cfg.n_heads * hd)
+    cx.matrix(&format!("{dst}.o_proj"), vec![o], cfg.n_heads * hd)
 }
 
 fn convert_mlp(cx: &mut Ctx, cfg: &Config, src: &str, dst: &str) -> Result<()> {
     let (g, _) = cx.load(&format!("{src}.gate_proj.weight"))?;
     let (u, _) = cx.load(&format!("{src}.up_proj.weight"))?;
-    cx.matrix(&format!("{dst}.gate_up"), &[g, u], cfg.hidden)?;
+    cx.matrix(&format!("{dst}.gate_up"), vec![g, u], cfg.hidden)?;
     let (d, _) = cx.load(&format!("{src}.down_proj.weight"))?;
-    cx.matrix(&format!("{dst}.down"), &[d], cfg.intermediate)
+    cx.matrix(&format!("{dst}.down"), vec![d], cfg.intermediate)
 }
 
-pub fn convert(hf_dir: &Path, out: &Path, recipe_name: &str, imatrix: Option<&Path>) -> Result<()> {
+pub fn convert(hf_dir: &Path, out: &Path, recipe_name: &str, imatrix: Option<&Path>, rotate: bool) -> Result<()> {
     let t0 = Instant::now();
     let recipe = Recipe::parse(recipe_name)?;
     let cfg_json: serde_json::Value = serde_json::from_str(
@@ -160,9 +202,12 @@ pub fn convert(hf_dir: &Path, out: &Path, recipe_name: &str, imatrix: Option<&Pa
     let cfg = Config::from_hf(&cfg_json)?;
     let tok_json = std::fs::read_to_string(hf_dir.join("tokenizer.json")).context("read tokenizer.json")?;
     let st = SafeTensors::open_dir(hf_dir)?;
-    let imatrix = match imatrix {
-        Some(p) => Some(crate::imatrix::load(p)?),
-        None => None,
+    let (imatrix, imatrix_rotated) = match imatrix {
+        Some(p) => {
+            let (m, r) = crate::imatrix::load(p)?;
+            (Some(m), r)
+        }
+        None => (None, false),
     };
     let prefix = if st.contains("model.language_model.embed_tokens.weight") {
         "model.language_model"
@@ -182,18 +227,18 @@ pub fn convert(hf_dir: &Path, out: &Path, recipe_name: &str, imatrix: Option<&Pa
         cfg.vocab
     );
 
-    let mut cx = Ctx { st: &st, w: Writer::create(out)?, total_params: 0, total_bytes: 0, imatrix, recipe: recipe.clone() };
+    let mut cx = Ctx { st: &st, w: Writer::create(out)?, total_params: 0, total_bytes: 0, imatrix, imatrix_rotated, recipe: recipe.clone(), rotate };
     let h = cfg.hidden;
 
     // Embedding / LM head
     let (emb, eshape) = cx.load(&format!("{prefix}.embed_tokens.weight"))?;
     let vocab_rows = eshape[0];
     if cfg.tie_embeddings {
-        cx.matrix("lm_head", &[emb], h)?;
+        cx.matrix("lm_head", vec![emb], h)?;
     } else {
-        cx.matrix("embed", &[emb], h)?;
+        cx.matrix("embed", vec![emb], h)?;
         let (lm, _) = cx.load("lm_head.weight")?;
-        cx.matrix("lm_head", &[lm], h)?;
+        cx.matrix("lm_head", vec![lm], h)?;
     }
     cx.norm("final_norm", &format!("{prefix}.norm.weight"), offset)?;
 
@@ -207,10 +252,10 @@ pub fn convert(hf_dir: &Path, out: &Path, recipe_name: &str, imatrix: Option<&Pa
                 let la = format!("{src}.linear_attn");
                 let (qkv, _) = cx.load(&format!("{la}.in_proj_qkv.weight"))?;
                 let (z, _) = cx.load(&format!("{la}.in_proj_z.weight"))?;
-                cx.matrix(&format!("{dst}.in_proj"), &[qkv, z], h)?;
+                cx.matrix(&format!("{dst}.in_proj"), vec![qkv, z], h)?;
                 let (b, _) = cx.load(&format!("{la}.in_proj_b.weight"))?;
                 let (a, _) = cx.load(&format!("{la}.in_proj_a.weight"))?;
-                cx.matrix(&format!("{dst}.in_ba"), &[b, a], h)?;
+                cx.matrix(&format!("{dst}.in_ba"), vec![b, a], h)?;
                 // conv1d.weight [C, 1, K] -> [K][C] so the runtime vectorizes over channels
                 let (cw, cs) = cx.load(&format!("{la}.conv1d.weight"))?;
                 let (c, kk) = (cs[0], cs[2]);
@@ -228,7 +273,7 @@ pub fn convert(hf_dir: &Path, out: &Path, recipe_name: &str, imatrix: Option<&Pa
                 cx.vector(&format!("{dst}.dt_bias"), &dtb)?;
                 cx.norm(&format!("{dst}.gnorm"), &format!("{la}.norm.weight"), false)?;
                 let (o, _) = cx.load(&format!("{la}.out_proj.weight"))?;
-                cx.matrix(&format!("{dst}.out_proj"), &[o], cfg.lin_value_dim())?;
+                cx.matrix(&format!("{dst}.out_proj"), vec![o], cfg.lin_value_dim())?;
             }
             LayerKind::Full => {
                 convert_attention(&mut cx, &cfg, &format!("{src}.self_attn"), &dst, offset)?;
@@ -243,7 +288,7 @@ pub fn convert(hf_dir: &Path, out: &Path, recipe_name: &str, imatrix: Option<&Pa
     let mut has_mtp = false;
     if cfg.mtp_layers > 0 && st.contains("mtp.fc.weight") {
         let (fc, _) = cx.load("mtp.fc.weight")?;
-        cx.matrix("mtp.fc", &[fc], 2 * h)?;
+        cx.matrix("mtp.fc", vec![fc], 2 * h)?;
         cx.norm("mtp.norm_e", "mtp.pre_fc_norm_embedding.weight", offset)?;
         cx.norm("mtp.norm_h", "mtp.pre_fc_norm_hidden.weight", offset)?;
         cx.norm("mtp.final_norm", "mtp.norm.weight", offset)?;
@@ -260,6 +305,7 @@ pub fn convert(hf_dir: &Path, out: &Path, recipe_name: &str, imatrix: Option<&Pa
     let mut meta = HashMap::new();
     meta.insert("source".into(), serde_json::json!(hf_dir.file_name().map(|s| s.to_string_lossy().to_string())));
     meta.insert("recipe".into(), serde_json::json!(recipe_name));
+    meta.insert("rotated".into(), serde_json::json!(rotate));
     meta.insert("has_mtp".into(), serde_json::json!(has_mtp));
     meta.insert("vocab_rows".into(), serde_json::json!(vocab_rows));
     meta.insert("params".into(), serde_json::json!(cx.total_params));

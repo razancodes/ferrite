@@ -95,6 +95,9 @@ enum Cmd {
         /// importance matrix (from `ferrite imatrix`) used for 4-bit quantization
         #[arg(long)]
         imatrix: Option<PathBuf>,
+        /// Hadamard-rotate weight matrices (much lower 4-bit error)
+        #[arg(long)]
+        rotate: bool,
     },
     /// Generate a completion for one prompt
     Run {
@@ -231,7 +234,7 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Convert { hf, out, quant, imatrix } => ferrite::convert::convert(&hf, &out, &quant, imatrix.as_deref()),
+        Cmd::Convert { hf, out, quant, imatrix, rotate } => ferrite::convert::convert(&hf, &out, &quant, imatrix.as_deref(), rotate),
         Cmd::Run { m, s, prompt, max_tokens, raw, think, system } => cmd_run(m, s, prompt, max_tokens, raw, think, system),
         Cmd::Chat { m, s, think, system, max_tokens } => cmd_chat(m, s, think, system, max_tokens),
         Cmd::Serve { m, host, port, max_tokens } => {
@@ -573,7 +576,8 @@ fn cmd_imatrix(m: ModelArgs, file: PathBuf, out: PathBuf, chunks: usize) -> Resu
             res.insert(name, sums.iter().map(|s| (s / *count as f64) as f32).collect::<Vec<f32>>());
         }
     }
-    ferrite::imatrix::save(&out, &res)?;
+    let rotated = e.model.file.header.tensors.iter().any(|t| t.rot > 0);
+    ferrite::imatrix::save(&out, &res, rotated)?;
     println!("saved importance matrix for {} tensors to {}", res.len(), out.display());
     Ok(())
 }

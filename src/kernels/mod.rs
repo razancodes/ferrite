@@ -19,6 +19,9 @@ pub struct QMat {
     pub len: usize,
     /// index of the tensor in the model file (for imatrix collection), or usize::MAX
     pub id: usize,
+    /// Hadamard rotation block of the input dimension (0 = none): activations
+    /// are rotated the same way before quantization
+    pub rot: usize,
 }
 unsafe impl Send for QMat {}
 unsafe impl Sync for QMat {}
@@ -70,7 +73,7 @@ pub fn isa() -> Isa {
     })
 }
 
-pub fn quantize_acts_into(pool: &ThreadPool, x: &[f32], t: usize, k: usize, qa: &mut QActs) {
+pub fn quantize_acts_into(pool: &ThreadPool, x: &[f32], t: usize, k: usize, rot: usize, qa: &mut QActs) {
     assert!(k.is_multiple_of(BLOCK));
     assert!(x.len() >= t * k);
     let nb = k / BLOCK;
@@ -83,8 +86,14 @@ pub fn quantize_acts_into(pool: &ThreadPool, x: &[f32], t: usize, k: usize, qa: 
     let dp = SyncPtr::new(&mut qa.d);
     let mp = SyncPtr::new(&mut qa.m);
     let work = |lo: usize, hi: usize| {
+        let mut tmp = if rot > 0 { vec![0f32; k] } else { Vec::new() };
         for tt in lo..hi {
-            let xr = &x[tt * k..(tt + 1) * k];
+            let mut xr = &x[tt * k..(tt + 1) * k];
+            if rot > 0 {
+                tmp.copy_from_slice(xr);
+                crate::quant::rotate(&mut tmp, rot);
+                xr = &tmp;
+            }
             let q = unsafe { qs.slice(tt * k, k) };
             let d = unsafe { dp.slice(tt * nb, nb) };
             let m = unsafe { mp.slice(tt * nb, nb) };
@@ -111,8 +120,14 @@ fn collect_imatrix(w: &QMat, x: &[f32], t: usize) {
     let mut g = IMATRIX.lock().unwrap();
     let map = g.get_or_insert_with(Default::default);
     let e = map.entry(w.id).or_insert_with(|| (vec![0f64; w.k], 0));
+    let mut tmp = vec![0f32; w.k];
     for tt in 0..t {
-        for (c, v) in x[tt * w.k..(tt + 1) * w.k].iter().enumerate() {
+        // statistics are collected in the space the weights live in (rotated or not)
+        tmp.copy_from_slice(&x[tt * w.k..(tt + 1) * w.k]);
+        if w.rot > 0 {
+            crate::quant::rotate(&mut tmp, w.rot);
+        }
+        for (c, v) in tmp.iter().enumerate() {
             e.0[c] += (*v as f64) * (*v as f64);
         }
     }
@@ -129,7 +144,7 @@ pub fn matmul(pool: &ThreadPool, w: &QMat, x: &[f32], t: usize, out: &mut [f32],
         DType::F32 => matmul_f32(pool, w, x, t, out),
         DType::U8 => panic!("U8 tensor used as a matrix"),
         DType::Q8R | DType::Q4R => {
-            quantize_acts_into(pool, x, t, w.k, qa);
+            quantize_acts_into(pool, x, t, w.k, w.rot, qa);
             matmul_q(pool, w, qa, out);
         }
     }
@@ -219,7 +234,7 @@ mod tests {
         }
         for dt in [DType::F32, DType::Q8R, DType::Q4R] {
             let data = quantize_matrix(&w, rows, k, dt, None);
-            let m = QMat { dtype: dt, rows, k, ptr: data.as_ptr(), len: data.len(), id: usize::MAX };
+            let m = QMat { dtype: dt, rows, k, ptr: data.as_ptr(), len: data.len(), id: usize::MAX, rot: 0 };
             // dequantized reference: isolates kernel bugs from quantization error
             let mut deq = vec![0f32; rows * k];
             for r in 0..rows {

@@ -24,7 +24,13 @@ pub struct Engine {
     pub spec: bool,
     /// threads used for (memory-bound) decoding; prefill uses the whole pool
     pub decode_threads: usize,
+    /// maximum tokens drafted per speculative step (MTP head chained on itself)
+    pub draft_k: usize,
+    /// keep chaining drafts only while the MTP head's top probability is at least this
+    pub draft_conf: f32,
     last_logits: Vec<f32>,
+    /// `last_logits` belong to the current end of the sequence
+    logits_fresh: bool,
     snapshot: Option<Snapshot>,
 }
 
@@ -90,6 +96,10 @@ pub fn default_decode_threads(pool: usize) -> usize {
     (pool / 2).clamp(1, 4).min(pool)
 }
 
+fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
 /// Default number of rows in the draft LM head.
 pub const DRAFT_VOCAB: usize = 32768;
 
@@ -109,7 +119,10 @@ impl Engine {
             chunk: 256,
             spec: false,
             decode_threads: default_decode_threads(threads),
+            draft_k: env_or("FERRITE_DRAFT_K", 2usize),
+            draft_conf: env_or("FERRITE_DRAFT_CONF", 0.5f32),
             last_logits: Vec::new(),
+            logits_fresh: false,
             snapshot: None,
         })
     }
@@ -130,6 +143,7 @@ impl Engine {
     pub fn reset(&mut self) {
         self.state = self.model.new_state(self.state.max_ctx);
         self.last_logits.clear();
+        self.logits_fresh = false;
     }
 
     pub fn pos(&self) -> usize {
@@ -156,10 +170,42 @@ impl Engine {
         }
     }
 
+    /// Argmax of the draft head's logits and its softmax probability.
+    fn draft_argmax(&mut self) -> (u32, f32) {
+        let draft = self.model.draft.as_ref().unwrap();
+        let n = draft.mat.rows;
+        let l = &mut self.sc_mtp.logits[..n];
+        let (best, mx) = l.iter().enumerate().fold((0, f32::NEG_INFINITY), |b, (i, &v)| if v > b.1 { (i, v) } else { b });
+        let id = draft.ids[best];
+        let sum = crate::ops::exp_sub_sum(l, mx); // logits are scratch from here on
+        (id, 1.0 / sum)
+    }
+
+    /// Draft up to `k` tokens: the first from the main model's hidden state,
+    /// the following ones by feeding the MTP head its own output, stopping
+    /// early once the head is unsure. The MTP position is rewound afterwards so
+    /// the speculative cache entries get recomputed from the verified states.
+    fn draft_chain(&mut self, next: u32, k: usize) -> Result<Vec<u32>> {
+        let h = self.hidden();
+        let (first, mut conf) = self.mtp_catchup(Some(next))?.expect("draft");
+        let base = self.state.mtp_pos;
+        let mut drafts = vec![first];
+        while drafts.len() < k && conf >= self.draft_conf {
+            let hid = self.sc_mtp.xn[..h].to_vec();
+            let prev = *drafts.last().unwrap();
+            self.model.mtp_forward(&self.pool, &mut self.state, &mut self.sc_mtp, &[prev], &hid, true)?;
+            let (d, c) = self.draft_argmax();
+            drafts.push(d);
+            conf = c;
+        }
+        self.state.mtp_pos = base;
+        Ok(drafts)
+    }
+
     /// Run the MTP head over every queued position whose next token is known.
     /// With `next` (the token at the current position), the final queued
-    /// position is processed too and a draft token is returned.
-    fn mtp_catchup(&mut self, next: Option<u32>) -> Result<Option<u32>> {
+    /// position is processed too and a draft token (with its probability) is returned.
+    fn mtp_catchup(&mut self, next: Option<u32>) -> Result<Option<(u32, f32)>> {
         let h = self.hidden();
         let st = &mut self.state;
         let queued = st.mtp_hidden.len() / h;
@@ -186,10 +232,7 @@ impl Engine {
         if !want {
             return Ok(None);
         }
-        let draft = self.model.draft.as_ref().unwrap();
-        let l = &self.sc_mtp.logits[..draft.mat.rows];
-        let best = l.iter().enumerate().fold((0, f32::NEG_INFINITY), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0;
-        Ok(Some(draft.ids[best]))
+        Ok(Some(self.draft_argmax()))
     }
 
     fn spec_ready(&self) -> bool {
@@ -221,6 +264,7 @@ impl Engine {
         let v = self.model.vocab_rows();
         self.last_logits.clear();
         self.last_logits.extend_from_slice(&self.sc.logits[..v]);
+        self.logits_fresh = true;
         Ok(&self.last_logits)
     }
 
@@ -256,6 +300,7 @@ impl Engine {
         self.state.mtp_pos = s.mtp_pos;
         self.state.mtp_hidden.clone_from(&s.mtp_hidden);
         self.last_logits.clone_from(&s.logits);
+        self.logits_fresh = true;
         true
     }
 
@@ -267,7 +312,8 @@ impl Engine {
     pub fn prime(&mut self, prompt: &[u32], snapshot_at: Option<usize>) -> Result<usize> {
         assert!(!prompt.is_empty());
         let st = &self.state.tokens;
-        let reused = if st.len() <= prompt.len() && prompt[..st.len()] == st[..] && !self.last_logits.is_empty() {
+        let prefix = st.len() <= prompt.len() && prompt[..st.len()] == st[..];
+        let reused = if prefix && !st.is_empty() && (st.len() < prompt.len() || self.logits_fresh) {
             st.len()
         } else if self
             .snapshot
@@ -351,12 +397,14 @@ impl Engine {
     }
 
     /// Self-speculative decoding. Each step:
-    ///   1. the MTP head drafts token d for position P+1 from (embed(next), h[P-1]),
-    ///   2. the main model runs [next, d] as one batch (memory-bound: ~cost of one
-    ///      token) with a state checkpoint after `next`,
-    ///   3. d is accepted with probability p(d) (exact speculative sampling for a
-    ///      deterministic draft); on rejection the recurrent state is rolled back
-    ///      by swapping in the checkpoint and the corrected token is used.
+    ///   1. the MTP head drafts up to `draft_k` tokens d1..dn (chained on its own
+    ///      hidden state, gated by confidence),
+    ///   2. the main model runs [next, d1..dn] as one batch (memory-bound: about
+    ///      the cost of one token) with a state checkpoint after every token,
+    ///   3. drafts are accepted left to right with probability p(d) (exact
+    ///      speculative sampling for a deterministic draft); at the first rejection
+    ///      the recurrent state is rolled back by swapping in the matching
+    ///      checkpoint and the corrected token is used.
     fn generate_spec(
         &mut self,
         sampler: &mut Sampler,
@@ -370,7 +418,8 @@ impl Engine {
         let h = self.hidden();
         let mut next = sampler.sample(&mut logits);
         sampler.accept(next);
-        loop {
+        let mut row = Vec::with_capacity(v);
+        'outer: loop {
             stats.gen_tokens += 1;
             if stop.contains(&next) {
                 stats.stop = StopReason::Eos;
@@ -384,47 +433,67 @@ impl Engine {
                 stats.stop = StopReason::Length;
                 break;
             }
-            if self.state.pos + 2 >= self.state.max_ctx {
+            let k = self.draft_k.clamp(1, max_new - stats.gen_tokens);
+            if self.state.pos + k + 1 >= self.state.max_ctx {
                 stats.stop = StopReason::Context;
                 break;
             }
             self.set_width(2);
-            let draft = self.mtp_catchup(Some(next))?.expect("draft");
+            let drafts = self.draft_chain(next, k)?;
+            let n = drafts.len();
             let p = self.state.pos;
-            self.model.forward_ckpt(&self.pool, &mut self.state, &mut self.sc, &[next, draft], Some(0))?;
-            self.push_mtp_hidden(0, 2);
-            self.model.logits(&self.pool, &mut self.sc, 0, 2);
-            stats.drafted += 1;
-            let mut l0 = self.sc.logits[..v].to_vec();
-            let (y, acc) = sampler.sample_spec(&mut l0, draft);
-            if acc && !stop.contains(&draft) {
+            let mut batch = Vec::with_capacity(n + 1);
+            batch.push(next);
+            batch.extend_from_slice(&drafts);
+            self.model.forward_ckpt(&self.pool, &mut self.state, &mut self.sc, &batch, n)?;
+            self.push_mtp_hidden(0, n + 1);
+            self.model.logits(&self.pool, &mut self.sc, 0, n + 1);
+            let mut accepted = 0;
+            let mut corrected = None;
+            let mut halt = None;
+            for (i, &d) in drafts.iter().enumerate() {
+                row.clear();
+                row.extend_from_slice(&self.sc.logits[i * v..(i + 1) * v]);
+                let (y, acc) = sampler.sample_spec(&mut row, d);
+                stats.drafted += 1;
+                if !acc || stop.contains(&d) {
+                    corrected = Some(y);
+                    break;
+                }
                 stats.accepted += 1;
-                sampler.accept(draft);
+                sampler.accept(d);
                 stats.gen_tokens += 1;
-                if !on_token(self, draft) {
-                    stats.stop = StopReason::Callback;
+                accepted += 1;
+                if !on_token(self, d) {
+                    halt = Some(StopReason::Callback);
                     break;
                 }
                 if stats.gen_tokens >= max_new {
-                    stats.stop = StopReason::Length;
+                    halt = Some(StopReason::Length);
                     break;
                 }
-                logits.clear();
-                logits.extend_from_slice(&self.sc.logits[v..2 * v]);
-                next = sampler.sample(&mut logits);
-                sampler.accept(next);
-            } else {
-                // undo the draft token: recurrent state <- checkpoint, KV length <- p+1
-                self.model.rollback(&mut self.state, p + 1);
-                let keep = self.state.mtp_hidden.len() - h;
-                self.state.mtp_hidden.truncate(keep);
-                next = y;
-                sampler.accept(next);
             }
+            if accepted < n {
+                // undo the unaccepted drafts: recurrent state <- checkpoint, KV length <- p+1+accepted
+                self.model.rollback(&self.pool, &mut self.state, p + 1 + accepted, accepted);
+                self.state.mtp_hidden.truncate((accepted + 1) * h);
+            }
+            if let Some(r) = halt {
+                stats.stop = r;
+                break 'outer;
+            }
+            next = match corrected {
+                Some(y) => y,
+                None => {
+                    row.clear();
+                    row.extend_from_slice(&self.sc.logits[n * v..(n + 1) * v]);
+                    sampler.sample(&mut row)
+                }
+            };
+            sampler.accept(next);
         }
-        // leave last_logits consistent for prompt reuse (not used after generation)
-        self.last_logits.clear();
-        self.last_logits.extend_from_slice(&self.sc.logits[..v]);
+        // the state has moved past the logits computed during verification
+        self.logits_fresh = false;
         Ok(())
     }
 }
