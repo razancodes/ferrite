@@ -1,0 +1,17 @@
+[package]
+name = "ferrite-gui"
+version = "0.1.0"
+edition = "2024"
+description = "Desktop chat app for the ferrite CPU inference engine"
+
+[[bin]]
+name = "ferrite-chat"
+path = "src/main.rs"
+
+[dependencies]
+ferrite = { path = ".." }
+eframe = { version = "0.36", default-features = false, features = ["accesskit", "default_fonts", "glow", "persistence"] }
+egui_commonmark = "0.25"
+rfd = "0.17"
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"

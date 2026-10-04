@@ -1,12 +1,14 @@
 # Build for the exact CPU we run on (Tiger Lake: AVX-512 + VNNI). The hot kernels
 # also do runtime feature detection, so the code stays portable if this is removed.
 #
-# The windows-gnu toolchain must use rustup's bundled 64-bit binutils: an old
-# 32-bit MinGW (C:\MinGW\bin) on PATH otherwise shadows dlltool.exe.
+# raw-dylib import libraries (windows-sys, pulled in by the GUI crates) need a
+# 64-bit dlltool whose own directory also holds a 64-bit `as.exe`; the old 32-bit
+# MinGW in C:\MinGW\bin on PATH would otherwise shadow both. WinLibs MinGW-w64
+# (`winget install BrechtSanders.WinLibs.POSIX.UCRT`) provides them.
 [target.x86_64-pc-windows-gnu]
 rustflags = [
     "-C", "target-cpu=native",
-    "-C", "dlltool=C:/Users/<user>/.rustup/toolchains/stable-x86_64-pc-windows-gnu/lib/rustlib/x86_64-pc-windows-gnu/bin/self-contained/dlltool.exe",
+    "-C", "dlltool=C:/Users/<user>/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/bin/dlltool.exe",
 ]
 
 [target.x86_64-pc-windows-msvc]

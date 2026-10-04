@@ -86,6 +86,35 @@ scripts/build_models.sh models/Qwen3.5-2B qwen3.5-2b      # q8 + imatrix + q6 + 
 ./target/release/ferrite serve -m models/qwen3.5-2b-q6.ferrite
 ```
 
+### Desktop chat app
+
+`ferrite chat` (the GUI) is a native Rust app built with egui (`gui/`). Double-click `chat.cmd`, or:
+
+```bash
+cargo build --release -p ferrite-gui
+target/release/ferrite-chat.exe        # run from the repo root so ./models is found
+```
+
+What it does:
+
+* **Models:** lists `.ferrite` files in `./models` (or open one with *Browse…*). It reopens the last
+  model on start and defaults to `qwen3.5-2b-q6`.
+* **Chat:** answers stream with markdown and syntax-highlighted code. Math the model writes in LaTeX
+  is shown as ×, ≤, √, and so on. Reasoning goes in a collapsible *Thoughts* section.
+* **Per-reply stats:** tok/s, prompt and cached tokens, draft acceptance, and time to first token.
+  There are Copy and Regenerate buttons.
+* **Settings** (saved across runs): MTP speculation, thinking mode, temperature, top-p, top-k,
+  min-p, presence penalty, max tokens, seed, system prompt, threads, context size, dark/light theme.
+* **Shortcuts:** start a message with `/think` or `/nothink` to switch thinking mode on the fly.
+  Enter sends, Shift+Enter adds a new line.
+* **Engine thread:** the engine runs on its own thread, so the UI stays responsive, and Stop takes
+  effect at the next token. Follow-up turns resume from a state snapshot instead of re-reading
+  the conversation.
+
+Building the GUI needs a 64-bit MinGW `dlltool` (see *Notes for this machine*).
+
+### HTTP API
+
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
   "messages": [{"role": "user", "content": "Hi!"}], "stream": true, "enable_thinking": false }'
@@ -230,9 +259,10 @@ cargo run --release --example bw_bench       # memory bandwidth ceiling
 
 ## Notes for this machine
 
-* The system `C:\MinGW` is a 32-bit GCC 6.3 toolchain whose `dlltool`/`as` shadow rustup's 64-bit
-  ones. `.cargo/config.toml` points rustc at the bundled `dlltool`, and clap's color feature is
-  disabled so no dependency needs raw-dylib import libraries.
+* The system `C:\MinGW` is a 32-bit GCC 6.3 toolchain whose `dlltool`/`as` shadow the 64-bit ones
+  that raw-dylib import libraries (windows-sys, used by the GUI crates) need. WinLibs MinGW-w64 is
+  installed (`winget install BrechtSanders.WinLibs.POSIX.UCRT`), and `.cargo/config.toml` points
+  rustc at its `dlltool`, which finds its own 64-bit `as.exe` next to it.
 * Windows cannot overwrite a file that a running process has memory-mapped. Don't convert onto a
   `.ferrite` file that a running `ferrite` is using.
 

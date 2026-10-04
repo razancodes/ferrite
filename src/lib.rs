@@ -20,5 +20,6 @@ pub mod quant;
 pub mod safetensors;
 pub mod sampler;
 pub mod server;
+pub mod stream;
 pub mod threadpool;
 pub mod tokenizer;
