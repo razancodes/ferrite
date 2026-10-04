@@ -317,9 +317,23 @@ impl Model {
         ids.retain(|i| !extra.contains(i) && (*i as usize) < vocab);
         ids.truncate(n - extra.len());
         ids.append(&mut extra);
-        let buf = crate::quant::gather_rows(self.lm_head.bytes(), self.lm_head.dtype, self.lm_head.k, &ids);
+        let mut buf = crate::quant::gather_rows(self.lm_head.bytes(), self.lm_head.dtype, self.lm_head.k, &ids);
+        // Optionally re-quantize the draft head to a smaller format: drafting only
+        // needs the right argmax, and the head is half of each draft step's bytes.
+        let mut dtype = self.lm_head.dtype;
+        if let Some(dt) = std::env::var("FERRITE_DRAFT_Q").ok().and_then(|v| DType::parse(&v)) {
+            if dt != dtype && dt != DType::F32 {
+                let k = self.lm_head.k;
+                let mut w = vec![0f32; ids.len() * k];
+                for (i, row) in w.chunks_exact_mut(k).enumerate() {
+                    crate::quant::dequantize_row(&buf, dtype, k, i, row);
+                }
+                buf = crate::quant::quantize_matrix(&w, ids.len(), k, dt, None);
+                dtype = dt;
+            }
+        }
         let mat = QMat {
-            dtype: self.lm_head.dtype,
+            dtype,
             rows: ids.len(),
             k: self.lm_head.k,
             ptr: buf.as_ptr(),
@@ -418,9 +432,7 @@ impl Model {
         if let Mixer::Full(aw) = &mtp.layer.mixer {
             self.attention(pool, aw, &mut st.mtp_k, &mut st.mtp_v, st.max_ctx, sc, t, pos0);
         }
-        for i in 0..t * h {
-            sc.x[i] += sc.mix[i];
-        }
+        par_add(pool, &mut sc.x, &sc.mix, t * h);
         self.mlp(pool, &mtp.layer, sc, t);
         st.mtp_pos += t;
         if logits {
@@ -504,9 +516,7 @@ impl Model {
         }
         {
             let _p = scope("norm+residual");
-            for i in 0..t * h {
-                sc.x[i] += sc.mix[i];
-            }
+            par_add(pool, &mut sc.x, &sc.mix, t * h);
         }
         self.mlp(pool, layer, sc, t);
         Ok(())
@@ -544,9 +554,7 @@ impl Model {
             matmul(pool, &layer.down, &sc.act, t, &mut sc.mix, &mut sc.qa);
         }
         let _p = scope("norm+residual");
-        for i in 0..t * h {
-            sc.x[i] += sc.mix[i];
-        }
+        par_add(pool, &mut sc.x, &sc.mix, t * h);
     }
 
     /// Gated DeltaNet token mixer. Leaves its output in `sc.mix`.
@@ -752,97 +760,120 @@ impl Model {
             });
         }
 
-        // attention: tasks = token x kv-head x key-split (flash-decoding style for long contexts)
-        let grp = nh / nkv;
-        let n_keys_max = pos0 + t;
-        let nsplit = if t == 1 { (n_keys_max / 256).clamp(1, (2 * pool.n_threads()).div_ceil(nkv).max(1)) } else { 1 };
-        let part_stride = hd + 2; // [m, l, acc...]
-        resize(&mut sc.part, t * nkv * nsplit * grp * part_stride);
-        resize(&mut sc.core, t * nh * hd);
-        {
+        if t >= 16 && std::env::var("FERRITE_NO_TILED_ATTN").is_err() {
+            // prefill: tiled causal attention (keys converted once per tile, reused by all queries)
             let _p = scope("attn.softmax_attn");
-            let proj = &sc.proj;
-            let kc: &[u16] = kc;
-            let vc: &[u16] = vc;
-            let part = SyncPtr::new(&mut sc.part);
-            let scale = 1.0 / (hd as f32).sqrt();
-            pool.par_tasks(t * nkv * nsplit, |task| {
-                let s = task % nsplit;
-                let g = (task / nsplit) % nkv;
-                let tok = task / (nsplit * nkv);
-                let n_keys = pos0 + tok + 1;
-                let chunk = n_keys.div_ceil(nsplit);
-                let k0 = (s * chunk).min(n_keys);
-                let k1 = ((s + 1) * chunk).min(n_keys);
-                let len = k1 - k0;
-                let row = &proj[tok * rows..(tok + 1) * rows];
-                let mut scores = vec![0f32; grp * len.max(1)];
-                for j in 0..len {
-                    let kr = &kc[(g * max_ctx + k0 + j) * hd..(g * max_ctx + k0 + j + 1) * hd];
-                    for qi in 0..grp {
-                        let hh = g * grp + qi;
-                        let q = &row[qoff + hh * hd..qoff + (hh + 1) * hd];
-                        scores[qi * len + j] = ops::dot_f32_f16(q, kr) * scale;
+            resize(&mut sc.core, t * nh * hd);
+            crate::attn::attention_prefill(
+                pool,
+                &sc.proj,
+                rows,
+                qoff,
+                goff,
+                c.attn_output_gate,
+                kc,
+                vc,
+                max_ctx,
+                &mut sc.core,
+                t,
+                pos0,
+                nh,
+                nkv,
+                hd,
+            );
+        } else {
+            // attention: tasks = token x kv-head x key-split (flash-decoding style for long contexts)
+            let grp = nh / nkv;
+            let n_keys_max = pos0 + t;
+            let nsplit = if t == 1 { (n_keys_max / 256).clamp(1, (2 * pool.n_threads()).div_ceil(nkv).max(1)) } else { 1 };
+            let part_stride = hd + 2; // [m, l, acc...]
+            resize(&mut sc.part, t * nkv * nsplit * grp * part_stride);
+            resize(&mut sc.core, t * nh * hd);
+            {
+                let _p = scope("attn.softmax_attn");
+                let proj = &sc.proj;
+                let kc: &[u16] = kc;
+                let vc: &[u16] = vc;
+                let part = SyncPtr::new(&mut sc.part);
+                let scale = 1.0 / (hd as f32).sqrt();
+                pool.par_tasks(t * nkv * nsplit, |task| {
+                    let s = task % nsplit;
+                    let g = (task / nsplit) % nkv;
+                    let tok = task / (nsplit * nkv);
+                    let n_keys = pos0 + tok + 1;
+                    let chunk = n_keys.div_ceil(nsplit);
+                    let k0 = (s * chunk).min(n_keys);
+                    let k1 = ((s + 1) * chunk).min(n_keys);
+                    let len = k1 - k0;
+                    let row = &proj[tok * rows..(tok + 1) * rows];
+                    let mut scores = vec![0f32; grp * len.max(1)];
+                    for j in 0..len {
+                        let kr = &kc[(g * max_ctx + k0 + j) * hd..(g * max_ctx + k0 + j + 1) * hd];
+                        for qi in 0..grp {
+                            let hh = g * grp + qi;
+                            let q = &row[qoff + hh * hd..qoff + (hh + 1) * hd];
+                            scores[qi * len + j] = ops::dot_f32_f16(q, kr) * scale;
+                        }
                     }
-                }
-                for qi in 0..grp {
-                    let base = ((tok * nkv + g) * nsplit + s) * grp + qi;
-                    let out = unsafe { part.slice(base * part_stride, part_stride) };
-                    let sl = &mut scores[qi * len..(qi + 1) * len];
-                    let m = sl.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-                    let l = if sl.is_empty() { 0.0 } else { ops::exp_sub_sum(sl, m) };
-                    out[0] = m;
-                    out[1] = l;
-                    out[2..].iter_mut().for_each(|x| *x = 0.0);
-                }
-                for j in 0..len {
-                    let vr = &vc[(g * max_ctx + k0 + j) * hd..(g * max_ctx + k0 + j + 1) * hd];
                     for qi in 0..grp {
                         let base = ((tok * nkv + g) * nsplit + s) * grp + qi;
-                        let out = unsafe { part.slice(base * part_stride + 2, hd) };
-                        ops::axpy_f16(out, scores[qi * len + j], vr);
+                        let out = unsafe { part.slice(base * part_stride, part_stride) };
+                        let sl = &mut scores[qi * len..(qi + 1) * len];
+                        let m = sl.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                        let l = if sl.is_empty() { 0.0 } else { ops::exp_sub_sum(sl, m) };
+                        out[0] = m;
+                        out[1] = l;
+                        out[2..].iter_mut().for_each(|x| *x = 0.0);
                     }
-                }
-            });
-            // merge partial softmaxes and apply the output gate
-            let part = &sc.part;
-            let core = SyncPtr::new(&mut sc.core);
-            let gated = c.attn_output_gate;
-            pool.par_chunks(t * nh, 1, |lo, hi| {
-                for idx in lo..hi {
-                    let tok = idx / nh;
-                    let hh = idx % nh;
-                    let g = hh / grp;
-                    let qi = hh % grp;
-                    let out = unsafe { core.slice((tok * nh + hh) * hd, hd) };
-                    let mut mmax = f32::NEG_INFINITY;
-                    for s in 0..nsplit {
-                        let b = (((tok * nkv + g) * nsplit + s) * grp + qi) * part_stride;
-                        if part[b + 1] > 0.0 {
-                            mmax = mmax.max(part[b]);
+                    for j in 0..len {
+                        let vr = &vc[(g * max_ctx + k0 + j) * hd..(g * max_ctx + k0 + j + 1) * hd];
+                        for qi in 0..grp {
+                            let base = ((tok * nkv + g) * nsplit + s) * grp + qi;
+                            let out = unsafe { part.slice(base * part_stride + 2, hd) };
+                            ops::axpy_f16(out, scores[qi * len + j], vr);
                         }
                     }
-                    out.iter_mut().for_each(|x| *x = 0.0);
-                    let mut denom = 0f32;
-                    for s in 0..nsplit {
-                        let b = (((tok * nkv + g) * nsplit + s) * grp + qi) * part_stride;
-                        if part[b + 1] <= 0.0 {
-                            continue;
+                });
+                // merge partial softmaxes and apply the output gate
+                let part = &sc.part;
+                let core = SyncPtr::new(&mut sc.core);
+                let gated = c.attn_output_gate;
+                pool.par_chunks(t * nh, 1, |lo, hi| {
+                    for idx in lo..hi {
+                        let tok = idx / nh;
+                        let hh = idx % nh;
+                        let g = hh / grp;
+                        let qi = hh % grp;
+                        let out = unsafe { core.slice((tok * nh + hh) * hd, hd) };
+                        let mut mmax = f32::NEG_INFINITY;
+                        for s in 0..nsplit {
+                            let b = (((tok * nkv + g) * nsplit + s) * grp + qi) * part_stride;
+                            if part[b + 1] > 0.0 {
+                                mmax = mmax.max(part[b]);
+                            }
                         }
-                        let w = (part[b] - mmax).exp();
-                        denom += w * part[b + 1];
-                        for d in 0..hd {
-                            out[d] += w * part[b + 2 + d];
+                        out.iter_mut().for_each(|x| *x = 0.0);
+                        let mut denom = 0f32;
+                        for s in 0..nsplit {
+                            let b = (((tok * nkv + g) * nsplit + s) * grp + qi) * part_stride;
+                            if part[b + 1] <= 0.0 {
+                                continue;
+                            }
+                            let w = (part[b] - mmax).exp();
+                            denom += w * part[b + 1];
+                            for d in 0..hd {
+                                out[d] += w * part[b + 2 + d];
+                            }
+                        }
+                        let inv = 1.0 / denom;
+                        let row = &proj[tok * rows..(tok + 1) * rows];
+                        out.iter_mut().for_each(|x| *x *= inv);
+                        if gated {
+                            ops::mul_sigmoid(out, &row[goff + hh * hd..goff + (hh + 1) * hd]);
                         }
                     }
-                    let inv = 1.0 / denom;
-                    let row = &proj[tok * rows..(tok + 1) * rows];
-                    out.iter_mut().for_each(|x| *x *= inv);
-                    if gated {
-                        ops::mul_sigmoid(out, &row[goff + hh * hd..goff + (hh + 1) * hd]);
-                    }
-                }
-            });
+                });
+            }
         }
         resize(&mut sc.mix, t * c.hidden);
         let _p = scope("attn.o_proj");
@@ -874,6 +905,23 @@ impl Model {
     pub fn vocab_rows(&self) -> usize {
         self.lm_head.rows
     }
+}
+
+/// x[..n] += y[..n], split across threads for large (prefill) batches.
+fn par_add(pool: &ThreadPool, x: &mut [f32], y: &[f32], n: usize) {
+    if n < 1 << 16 {
+        for i in 0..n {
+            x[i] += y[i];
+        }
+        return;
+    }
+    let xp = SyncPtr::new(x);
+    pool.par_chunks(n, 4096, |lo, hi| {
+        let xs = unsafe { xp.slice(lo, hi - lo) };
+        for (a, b) in xs.iter_mut().zip(&y[lo..hi]) {
+            *a += b;
+        }
+    });
 }
 
 fn par_rmsnorm(pool: &ThreadPool, x: &[f32], w: &[f32], eps: f32, out: &mut [f32], t: usize, h: usize) {

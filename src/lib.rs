@@ -5,6 +5,7 @@
 // arguments on purpose.
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 
+pub mod attn;
 pub mod chat;
 pub mod config;
 pub mod convert;

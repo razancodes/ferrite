@@ -146,16 +146,69 @@ pub fn append_tensor(path: &Path, name: &str, dtype: DType, shape: &[usize], dat
     Ok(())
 }
 
+/// Weights live either in a read-only memory map of the file or in
+/// page-aligned heap memory (FERRITE_LOAD=heap): the heap copy costs a read at
+/// load time but gives fresh physical pages, which on this laptop's
+/// asymmetric (flex-mode) DIMMs can be noticeably faster to stream from.
+pub enum Storage {
+    Mmap(Mmap),
+    Heap { ptr: *mut u8, len: usize },
+}
+
+unsafe impl Send for Storage {}
+unsafe impl Sync for Storage {}
+
+const HEAP_ALIGN: usize = 4096;
+
+impl std::ops::Deref for Storage {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Storage::Mmap(m) => m,
+            Storage::Heap { ptr, len } => unsafe { std::slice::from_raw_parts(*ptr, *len) },
+        }
+    }
+}
+
+impl Drop for Storage {
+    fn drop(&mut self) {
+        if let Storage::Heap { ptr, len } = *self {
+            unsafe { std::alloc::dealloc(ptr, std::alloc::Layout::from_size_align(len.max(1), HEAP_ALIGN).unwrap()) };
+        }
+    }
+}
+
+impl Storage {
+    fn heap_from_file(f: &mut File) -> Result<Storage> {
+        use std::io::Read;
+        let len = f.metadata()?.len() as usize;
+        let layout = std::alloc::Layout::from_size_align(len.max(1), HEAP_ALIGN)?;
+        let ptr = unsafe { std::alloc::alloc(layout) };
+        if ptr.is_null() {
+            bail!("out of memory allocating {len} bytes for the model");
+        }
+        let buf = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+        let st = Storage::Heap { ptr, len };
+        f.read_exact(buf)?;
+        Ok(st)
+    }
+}
+
 pub struct ModelFile {
-    pub mmap: Mmap,
+    pub mmap: Storage,
     pub header: Header,
     index: HashMap<String, usize>,
 }
 
 impl ModelFile {
     pub fn open(path: &Path) -> Result<ModelFile> {
-        let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
-        let mmap = unsafe { Mmap::map(&f) }.context("mmap model")?;
+        let mut f = File::open(path).with_context(|| format!("open {}", path.display()))?;
+        let heap = std::env::var("FERRITE_LOAD").map(|v| v == "heap").unwrap_or(false);
+        let mmap = if heap {
+            Storage::heap_from_file(&mut f)?
+        } else {
+            Storage::Mmap(unsafe { Mmap::map(&f) }.context("mmap model")?)
+        };
         let n = mmap.len();
         if n < 32 || &mmap[0..8] != MAGIC || &mmap[n - 8..] != MAGIC {
             bail!("{} is not a ferrite model file", path.display());

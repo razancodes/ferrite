@@ -37,28 +37,36 @@ fn main() {
         let macs = (threads * iters * 12 * 64) as f64;
         println!("raw vpdpbusd peak, {threads} thread(s): {:.1} GMAC/s ({:.2} GHz-equivalent per core)", macs / secs / 1e9, macs / secs / 1e9 / 64.0 / threads as f64);
     }
-    let (rows, k) = (2048usize, 1024usize);
+    // A realistic decode stream: cycle through 8 different 16384 x 2048 matrices
+    // (8 x 17-35 MB, far larger than the 8 MB L3) so every read comes from DRAM.
+    let (rows, k) = (16384usize, 2048usize);
     let w: Vec<f32> = (0..rows * k).map(|i| ((i * 7919) % 1000) as f32 / 1000.0 - 0.5).collect();
-    for dt in [DType::Q8R, DType::Q4R] {
-        let data = quantize_matrix(&w, rows, k, dt, None);
-        let m = QMat { dtype: dt, rows, k, ptr: data.as_ptr(), len: data.len(), id: usize::MAX, rot: 0 };
-        for (threads, t) in [(1usize, 1usize), (4, 1), (1, 64), (4, 256)] {
+    for dt in [DType::Q8R, DType::Q6R, DType::Q4R] {
+        let mats: Vec<Vec<u8>> = (0..8).map(|_| quantize_matrix(&w, rows, k, dt, None)).collect();
+        let qm: Vec<QMat> = mats
+            .iter()
+            .map(|d| QMat { dtype: dt, rows, k, ptr: d.as_ptr(), len: d.len(), id: usize::MAX, rot: 0 })
+            .collect();
+        for (threads, t) in [(1usize, 1usize), (2, 1), (4, 1), (4, 4)] {
             let pool = ThreadPool::new(threads);
             let x: Vec<f32> = (0..t * k).map(|i| ((i * 31) % 97) as f32 / 97.0 - 0.5).collect();
             let mut out = vec![0f32; t * rows];
             let mut qa = QActs::default();
-            matmul(&pool, &m, &x, t, &mut out, &mut qa);
-            let reps = (2000 / t).max(4);
+            for m in &qm {
+                matmul(&pool, m, &x, t, &mut out, &mut qa);
+            }
+            let reps = 6;
             let t0 = Instant::now();
             for _ in 0..reps {
-                matmul(&pool, &m, &x, t, &mut out, &mut qa);
+                for m in &qm {
+                    matmul(&pool, m, &x, t, &mut out, &mut qa);
+                }
             }
-            let secs = t0.elapsed().as_secs_f64() / reps as f64;
+            let secs = t0.elapsed().as_secs_f64() / (reps * qm.len()) as f64;
             println!(
-                "{dt:?} {rows}x{k} tokens={t:<4} threads={threads}: {:8.1} us  {:6.1} GMAC/s  {:5.1} GB/s weights",
+                "{dt:?} tokens={t} threads={threads}: {:8.1} us/matrix  {:5.1} GB/s",
                 secs * 1e6,
-                (rows * k * t) as f64 / secs / 1e9,
-                data.len() as f64 / secs / 1e9
+                mats[0].len() as f64 / secs / 1e9
             );
         }
     }

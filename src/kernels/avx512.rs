@@ -169,7 +169,9 @@ unsafe fn tile_q6r<const NT: usize>(
     unsafe {
         let m4 = _mm512_set1_epi8(0x0F);
         let m30 = _mm512_set1_epi8(0x30);
-        let c96 = _mm512_set1_epi8(96); // u6 + 96 = value + 128
+        // u6 = value + 32 is fed to vpdpbusd directly; the offset is removed with
+        // a quarter of the usual 128*sum(x) correction (no per-byte +96 add)
+        let quarter = _mm512_set1_ps(0.25);
         let mut acc = [_mm512_setzero_ps(); NT];
         for b in 0..nb {
             let dw = _mm512_cvtph_ps(_mm256_loadu_si256(gs.add(b * 32) as *const __m256i));
@@ -189,7 +191,8 @@ unsafe fn tile_q6r<const NT: usize>(
                         2 => hv,
                         _ => _mm512_srli_epi16::<2>(hv),
                     };
-                    let wv = _mm512_add_epi8(_mm512_or_si512(lo, _mm512_and_si512(hb, m30)), c96);
+                    // lo | (hb & 0x30) in one vpternlogd
+                    let wv = _mm512_ternarylogic_epi32::<0xF8>(lo, hb, m30);
                     for t in 0..NT {
                         if jj % 2 == 0 {
                             ia[t] = _mm512_dpbusd_epi32(ia[t], wv, bcast4(xb.add(t * k + j * 4)));
@@ -203,7 +206,7 @@ unsafe fn tile_q6r<const NT: usize>(
                 let s = _mm512_fmsub_ps(
                     _mm512_cvtepi32_ps(_mm512_add_epi32(ia[t], ib[t])),
                     _mm512_set1_ps(*xd.add(t * nb + b)),
-                    _mm512_set1_ps(*xm.add(t * nb + b)),
+                    _mm512_mul_ps(quarter, _mm512_set1_ps(*xm.add(t * nb + b))),
                 );
                 acc[t] = _mm512_fmadd_ps(s, dw, acc[t]);
             }
