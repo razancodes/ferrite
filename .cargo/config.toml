@@ -1,0 +1,13 @@
+# Build for the exact CPU we run on (Tiger Lake: AVX-512 + VNNI). The hot kernels
+# also do runtime feature detection, so the code stays portable if this is removed.
+#
+# The windows-gnu toolchain must use rustup's bundled 64-bit binutils: an old
+# 32-bit MinGW (C:\MinGW\bin) on PATH otherwise shadows dlltool.exe.
+[target.x86_64-pc-windows-gnu]
+rustflags = [
+    "-C", "target-cpu=native",
+    "-C", "dlltool=C:/Users/<user>/.rustup/toolchains/stable-x86_64-pc-windows-gnu/lib/rustlib/x86_64-pc-windows-gnu/bin/self-contained/dlltool.exe",
+]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=native"]

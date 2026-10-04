@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ferrite chat</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #ffffff; --text: #1d1d1f; --muted: #6b6b70; --border: #e2e0da;
+    --accent: #b5532b; --accent-soft: #f3e3da; --user: #efeae2; --code: #f1efe9; --think: #f8f4ec;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #151514; --panel: #1d1d1b; --text: #ecebe8; --muted: #9a9892; --border: #2f2e2b;
+      --accent: #e0814f; --accent-soft: #3a2a20; --user: #262522; --code: #262522; --think: #22201c; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; height: 100vh; display: flex; flex-direction: column; }
+  header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--panel); flex-wrap: wrap; }
+  header .logo { font-weight: 700; letter-spacing: .2px; }
+  header .logo span { color: var(--accent); }
+  header .model { color: var(--muted); font-size: 13px; }
+  header .spacer { flex: 1; }
+  header label { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  header input[type=number] { width: 70px; padding: 3px 6px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); }
+  button { font: inherit; border: 1px solid var(--border); background: var(--panel); color: var(--text); border-radius: 8px; padding: 6px 12px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  #log { flex: 1; overflow-y: auto; padding: 20px 16px 8px; }
+  .msg { max-width: 820px; margin: 0 auto 18px; }
+  .msg.user .bubble { background: var(--user); border-radius: 14px; padding: 10px 14px; display: inline-block; white-space: pre-wrap; }
+  .msg.user { text-align: right; }
+  .msg.user .bubble { text-align: left; }
+  .msg.assistant .bubble { padding: 2px 2px; }
+  .bubble p { margin: 0 0 .7em; }
+  .bubble pre { background: var(--code); padding: 10px 12px; border-radius: 8px; overflow-x: auto; font-size: 13px; }
+  .bubble code { background: var(--code); padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+  .bubble pre code { padding: 0; background: none; }
+  details.think { background: var(--think); border: 1px solid var(--border); border-radius: 10px; padding: 6px 12px; margin-bottom: 10px; color: var(--muted); font-size: 13.5px; }
+  details.think summary { cursor: pointer; font-weight: 600; }
+  details.think div { white-space: pre-wrap; margin-top: 6px; }
+  .stats { font-size: 12px; color: var(--muted); margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .cursor::after { content: "▍"; color: var(--accent); animation: blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  footer { padding: 10px 16px 16px; }
+  .composer { max-width: 820px; margin: 0 auto; display: flex; gap: 8px; align-items: flex-end; background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 8px; }
+  textarea { flex: 1; border: none; resize: none; background: transparent; color: var(--text); font: inherit; padding: 6px; outline: none; max-height: 200px; }
+  .empty { text-align: center; color: var(--muted); margin-top: 18vh; }
+  .empty h1 { font-size: 28px; color: var(--text); margin-bottom: 6px; }
+  @media (max-width: 600px) { header .model { display: none; } }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">fer<span>rite</span></div>
+  <div class="model" id="model">connecting…</div>
+  <div class="spacer"></div>
+  <label><input type="checkbox" id="think"> thinking</label>
+  <label>temp <input type="number" id="temp" step="0.1" min="0" max="2" value="0.7"></label>
+  <label>max <input type="number" id="maxtok" step="64" min="16" value="2048"></label>
+  <button id="clear">New chat</button>
+</header>
+<div id="log"><div class="empty"><h1>Local inference, no GPU</h1><div>Running on your CPU with ferrite's AVX-512 kernels.</div></div></div>
+<footer>
+  <div class="composer">
+    <textarea id="input" rows="1" placeholder="Message the model… (Enter to send, Shift+Enter for newline)"></textarea>
+    <button class="primary" id="send">Send</button>
+  </div>
+</footer>
+<script>
+const log = document.getElementById('log'), input = document.getElementById('input'), sendBtn = document.getElementById('send');
+let history = [], busy = false, controller = null;
+
+fetch('/v1/models').then(r => r.json()).then(j => { document.getElementById('model').textContent = j.data[0].id; })
+  .catch(() => { document.getElementById('model').textContent = 'offline'; });
+
+function esc(s) { return s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function md(src) {
+  const parts = src.split(/```/);
+  return parts.map((p, i) => {
+    if (i % 2) { const nl = p.indexOf('\n'); return '<pre><code>' + esc(nl >= 0 ? p.slice(nl + 1) : p) + '</code></pre>'; }
+    return esc(p).replace(/`([^`\n]+)`/g, '<code>$1</code>').replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
+      .split(/\n{2,}/).map(x => x.trim() ? '<p>' + x.replace(/\n/g, '<br>') + '</p>' : '').join('');
+  }).join('');
+}
+function add(role) {
+  if (log.querySelector('.empty')) log.innerHTML = '';
+  const m = document.createElement('div'); m.className = 'msg ' + role;
+  m.innerHTML = '<div class="bubble"></div>' + (role === 'assistant' ? '<div class="stats"></div>' : '');
+  log.appendChild(m); log.scrollTop = log.scrollHeight; return m;
+}
+function setBusy(b) { busy = b; sendBtn.textContent = b ? 'Stop' : 'Send'; }
+
+async function send() {
+  if (busy) { controller && controller.abort(); return; }
+  const text = input.value.trim(); if (!text) return;
+  input.value = ''; input.style.height = 'auto';
+  history.push({role: 'user', content: text});
+  add('user').querySelector('.bubble').textContent = text;
+  const m = add('assistant'), bubble = m.querySelector('.bubble'), stats = m.querySelector('.stats');
+  bubble.classList.add('cursor');
+  let content = '', reasoning = '', thinkEl = null;
+  setBusy(true); controller = new AbortController();
+  const t0 = performance.now(); let first = 0, ntok = 0;
+  try {
+    const res = await fetch('/v1/chat/completions', { method: 'POST', signal: controller.signal, headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ messages: history, stream: true, enable_thinking: document.getElementById('think').checked,
+        temperature: parseFloat(document.getElementById('temp').value), max_tokens: parseInt(document.getElementById('maxtok').value) }) });
+    if (!res.ok) { bubble.textContent = 'Error: ' + (await res.text()); throw 0; }
+    const reader = res.body.getReader(), dec = new TextDecoder(); let buf = '';
+    while (true) {
+      const {done, value} = await reader.read(); if (done) break;
+      buf += dec.decode(value, {stream: true});
+      let i;
+      while ((i = buf.indexOf('\n\n')) >= 0) {
+        const line = buf.slice(0, i).trim(); buf = buf.slice(i + 2);
+        if (!line.startsWith('data:')) continue;
+        const data = line.slice(5).trim(); if (data === '[DONE]') continue;
+        const j = JSON.parse(data), d = j.choices[0].delta || {};
+        if (!first && (d.content || d.reasoning_content)) first = performance.now();
+        if (d.reasoning_content) {
+          ntok++; reasoning += d.reasoning_content;
+          if (!thinkEl) { thinkEl = document.createElement('details'); thinkEl.className = 'think'; thinkEl.open = true;
+            thinkEl.innerHTML = '<summary>Thinking</summary><div></div>'; m.insertBefore(thinkEl, bubble); }
+          thinkEl.querySelector('div').textContent = reasoning;
+        }
+        if (d.content) { ntok++; content += d.content; bubble.innerHTML = md(content); if (thinkEl) thinkEl.open = false; }
+        if (j.timings) {
+          const t = j.timings;
+          stats.textContent = `${t.predicted_per_second.toFixed(1)} tok/s · ${t.predicted_n} tokens · prompt ${t.prompt_n} tok @ ${t.prompt_per_second.toFixed(0)} tok/s` +
+            (t.cached_n ? ` · ${t.cached_n} cached` : '') + ` · first token ${t.time_to_first_token_ms.toFixed(0)} ms`;
+        }
+        log.scrollTop = log.scrollHeight;
+      }
+    }
+  } catch (e) { if (e && e.name === 'AbortError') stats.textContent = 'stopped'; }
+  bubble.classList.remove('cursor');
+  history.push({role: 'assistant', content});
+  setBusy(false);
+}
+sendBtn.onclick = send;
+input.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
+input.addEventListener('input', () => { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 200) + 'px'; });
+document.getElementById('clear').onclick = () => { if (busy) return; history = []; log.innerHTML = '<div class="empty"><h1>New chat</h1></div>'; };
+document.getElementById('think').onchange = e => { document.getElementById('temp').value = e.target.checked ? '1.0' : '0.7'; };
+</script>
+</body>
+</html>

@@ -1,0 +1,6 @@
+/target
+/models
+*.ferrite
+/scratch
+__pycache__/
+/data
