@@ -30,7 +30,17 @@
     try {
       localStorage.setItem("ferrite.settings", JSON.stringify(S));
     } catch (_) {}
+    markPreset();
   };
+  // one-click configurations for the loaded model (the model itself is never swapped)
+  const PRESETS = {
+    think: { think: true, spec: true, maxTokens: 32768, ctx: 32768, sampler: QWEN.think },
+    speed: { think: false, spec: true, motion: false, maxTokens: 2048, sampler: QWEN.chat },
+  };
+  const matches = (p) => Object.keys(p).every((k) => (k === "sampler" ? Object.keys(p.sampler).every((j) => S.sampler[j] === p.sampler[j]) : S[k] === p[k]));
+  function markPreset() {
+    for (const name in PRESETS) $("p-" + name).classList.toggle("on", matches(PRESETS[name]));
+  }
 
   // ───────────────────────── state ─────────────────────────
   let models = [];
@@ -107,6 +117,7 @@
   function applySpec() {
     setTog("t-spec", S.spec ? "on" : "off");
     $("t-spec").disabled = !!(info && !info.has_mtp);
+    markPreset(); // the engine can flip spec on load
   }
   function setThinking(on) {
     if (S.think === on) return;
@@ -116,36 +127,68 @@
     renderSampling();
     save();
   }
+  function applyPreset(name) {
+    if (generating || loadingName) return toast("Wait for the current reply to finish");
+    const p = PRESETS[name];
+    // a bigger context only takes effect on load: reload the current model if it changes
+    const reload = info && p.ctx && p.ctx !== info.ctx ? info.path : null;
+    Object.assign(S, p, { sampler: { ...p.sampler } });
+    if (info && !info.has_mtp) S.spec = false;
+    applyThink();
+    applySpec();
+    applyMotion();
+    renderSampling();
+    save();
+    if (reload) loadModel(reload);
+    else if (info && info.spec !== S.spec) invoke("set_spec", { on: S.spec });
+    toast(
+      name === "think"
+        ? `Max think — reasoning on, thinking sampler, up to ${thousands(p.maxTokens)} tokens${reload ? " · reloading with a 32K context" : ""}`
+        : "Max speed — thinking off, MTP speculation on, animation off"
+    );
+  }
   function fieldMode() {
     if (fig) fig.setVisible(msgs.length === 0);
     if (!field) return;
     field.setMode(msgs.length === 0 ? "hero" : generating ? "busy" : "chat");
   }
 
-  // ───────────────────────── sidebar: models ─────────────────────────
+  // ───────────────────────── sidebar: models (a dropdown) ─────────────────────────
+  const quantOf = (m) => esc((m.quant || prettyName(m.name).quant || "?").toUpperCase());
   function renderModels() {
-    const box = $("models");
     $("model-count").textContent = models.length ? `${models.length} found` : "none";
-    if (!models.length) {
-      box.innerHTML = `<div class="mrow" style="grid-template-columns:1fr"><span class="label">No .ferrite files in ./models — use Browse.</span></div>`;
-      return;
+    const curPath = (info ? info.path : S.modelPath || "").toLowerCase();
+    const ci = models.findIndex((m) => m.path.toLowerCase() === curPath);
+    const cur = models[ci];
+    const name = cur ? cur.name : loadingName;
+
+    // the trigger: the current model as the "selected label"
+    const sum = $("mcur");
+    sum.classList.toggle("loading", !!loadingName);
+    const caret = `<span class="go" aria-hidden="true">${loadingName ? "loading" : "▾"}</span>`;
+    if (name) {
+      const meta = cur ? `<span class="tag">${quantOf(cur)}</span><span class="label">${fmt(cur.size_gb, 2)} GB</span>${cur.params_b ? `<span class="label">· ${fmt(cur.params_b, 2)}B</span>` : ""}` : "";
+      sum.innerHTML = `<span class="idx">M/${ci >= 0 ? pad2(ci + 1) : "··"}</span><span class="nm">${prettyName(name).html}</span>${caret}<span class="meta">${meta}</span>`;
+    } else {
+      sum.innerHTML = `<span class="idx">M/··</span><span class="nm">${models.length ? "Choose a model" : "No models"}</span>${caret}<span class="meta"><span class="label">${models.length ? "click to pick" : "none in ./models — use Browse"}</span></span>`;
     }
+    sum.insertAdjacentHTML("beforeend", `<span class="h1"></span><span class="h2"></span>`);
+
+    // the list
+    const box = $("models");
     box.innerHTML = "";
     models.forEach((m, i) => {
       const n = prettyName(m.name);
-      const isSel = info ? info.path.toLowerCase() === m.path.toLowerCase() : S.modelPath && S.modelPath.toLowerCase() === m.path.toLowerCase();
-      const isLoading = loadingName && loadingName === m.name;
       const row = document.createElement("button");
-      row.className = "mrow" + (isSel || isLoading ? " sel" : "") + (isLoading ? " loading" : "");
       row.type = "button";
+      // a heavier rule where the model size changes (0.8B | 2B | 4B)
+      row.className = "mopt" + (i === ci ? " cur" : "") + (i && prettyName(models[i - 1].name).plain !== n.plain ? " grp" : "");
       row.title = m.path;
-      row.innerHTML = `<span class="idx">M/${pad2(i + 1)}</span><span class="nm">${n.html}</span><span class="go">${isLoading ? "loading" : isSel && info ? "●" : "→"}</span>
-        <span class="meta"><span class="tag">${esc((m.quant || n.quant || "?").toUpperCase())}</span><span class="label">${fmt(m.size_gb, 2)} GB</span>${m.params_b ? `<span class="label">· ${fmt(m.params_b, 2)}B</span>` : ""}</span>
-        <span class="h1"></span><span class="h2"></span>`;
+      row.innerHTML = `<span class="nm">${n.html}</span><span class="tag">${quantOf(m)}</span><span class="label">${fmt(m.size_gb, 2)} GB</span>`;
       row.addEventListener("click", () => {
-        if (generating || loadingName) return;
-        if (info && info.path.toLowerCase() === m.path.toLowerCase()) return;
-        loadModel(m.path);
+        $("msel").open = false;
+        if (generating || loadingName) return toast("Wait for the current reply to finish");
+        if (i !== ci || !info) loadModel(m.path);
       });
       box.appendChild(row);
     });
@@ -689,6 +732,11 @@
     if (info) invoke("set_spec", { on: S.spec });
   });
   $("t-new").addEventListener("click", newChat);
+  $("p-think").addEventListener("click", () => applyPreset("think"));
+  $("p-speed").addEventListener("click", () => applyPreset("speed"));
+  document.addEventListener("click", (e) => {
+    if ($("msel").open && !$("msel").contains(e.target)) $("msel").open = false;
+  });
   $("rescan").addEventListener("click", refreshModels);
   $("defaults").addEventListener("click", () => {
     S.sampler = { ...(S.think ? QWEN.think : QWEN.chat) };
@@ -731,6 +779,9 @@
     if (e.ctrlKey && (e.key === "n" || e.key === "N")) {
       e.preventDefault();
       newChat();
+    } else if (e.key === "Escape" && $("msel").open) {
+      $("msel").open = false;
+      $("mcur").focus();
     } else if (e.key === "Escape" && generating) {
       invoke("stop");
     } else if (e.ctrlKey && (e.key === "l" || e.key === "L")) {

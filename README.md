@@ -104,9 +104,9 @@ PATH="$LOCALAPPDATA/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_M
 target/release/ferrite-chat.exe
 ```
 
-* **Models:** the app lists the `.ferrite` files in `./models` as a ledger showing quant, size
-  and parameter count. *Browse* opens any other model file. On start it reopens the last model
-  you used, or `qwen3.5-2b-q6` the first time.
+* **Models:** a dropdown of the `.ferrite` files in `./models`, showing each one's quant and size.
+  *Browse* opens any other model file. On start it reopens the last model you used, or
+  `qwen3.5-2b-q6` the first time.
 * **Chat:** answers stream as markdown. LaTeX renders with KaTeX (`$…$`, `$$…$$`, `\(…\)`,
   `\[…\]`). Code blocks get highlight.js and a copy button. Reasoning goes in a collapsible
   block, and links open in your default browser.
@@ -116,6 +116,10 @@ target/release/ferrite-chat.exe
   dithered sparkline.
 * **Settings:** THINK, SPEC (MTP speculation), MOTION and INK/PAPER toggles; sampling (Qwen
   presets for chat and thinking); and the system prompt. Settings are saved across runs.
+* **Presets:** *Max think* turns thinking on with Qwen's thinking sampler, a 32K context and up
+  to 32K new tokens. It reloads the model if the context size changes. *Max speed* turns
+  thinking off and MTP speculation on, uses the chat sampler with 2K max tokens, and stops the
+  animation. Neither preset changes which model is loaded.
 * **Shortcuts:** Enter sends and Shift+Enter adds a new line. Start a message with `/think` or
   `/nothink` to switch modes. Esc stops generation, Ctrl+N starts a new chat and Ctrl+L focuses
   the input.
