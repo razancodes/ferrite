@@ -88,30 +88,46 @@ scripts/build_models.sh models/Qwen3.5-2B qwen3.5-2b      # q8 + imatrix + q6 + 
 
 ### Desktop chat app
 
-`ferrite chat` (the GUI) is a native Rust app built with egui (`gui/`). Double-click `chat.cmd`, or:
+`ferrite chat` is a Tauri 2 desktop app (`app/`). The Rust side runs the engine in-process; the
+front end is plain HTML/CSS/JS with no bundler. Its look follows the portfolio's "Dither Ledger"
+design system: ink/paper themes with an ember accent, Cormorant Garamond, Manrope and IBM Plex
+Mono, hairline ledger rows, and an 8x8 Bayer-dithered WebGL contour field. The field ripples as
+tokens arrive.
+
+Double-click `chat.cmd`. It builds the app the first time and then launches it. To rebuild
+after changes, run `chat.cmd rebuild`. To build by hand:
 
 ```bash
-cargo build --release -p ferrite-gui
-target/release/ferrite-chat.exe        # run from the repo root so ./models is found
+# WinLibs must be first on PATH so Tauri's resource step finds a 64-bit windres
+PATH="$LOCALAPPDATA/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/bin:$PATH" \
+  cargo build --release -p ferrite-app
+target/release/ferrite-chat.exe
 ```
 
-What it does:
+* **Models:** the app lists the `.ferrite` files in `./models` as a ledger showing quant, size
+  and parameter count. *Browse* opens any other model file. On start it reopens the last model
+  you used, or `qwen3.5-2b-q6` the first time.
+* **Chat:** answers stream as markdown. LaTeX renders with KaTeX (`$…$`, `$$…$$`, `\(…\)`,
+  `\[…\]`). Code blocks get highlight.js and a copy button. Reasoning goes in a collapsible
+  block, and links open in your default browser.
+* **Stats on each reply:** tok/s, tokens, prompt and cached tokens, draft acceptance, time to
+  first token, and context used. Each reply also has Copy and Regenerate buttons.
+* **Machine panel:** shows the CPU, ISA and thread count, plus a live tok/s readout with a
+  dithered sparkline.
+* **Settings:** THINK, SPEC (MTP speculation), MOTION and INK/PAPER toggles; sampling (Qwen
+  presets for chat and thinking); and the system prompt. Settings are saved across runs.
+* **Shortcuts:** Enter sends and Shift+Enter adds a new line. Start a message with `/think` or
+  `/nothink` to switch modes. Esc stops generation, Ctrl+N starts a new chat and Ctrl+L focuses
+  the input.
+* **Keeping the model fast:** the engine runs on its own thread, and follow-up turns resume from
+  a state snapshot. While a reply streams, only the paragraph still growing is re-rendered,
+  syntax highlighting waits until the reply finishes, and the dither field drops to 15 fps.
+  MOTION off stops the animation entirely.
+* **Scripted demo:** `FERRITE_CHAT_AUTOSEND="first message||second message"` sends messages
+  automatically once the model has loaded.
 
-* **Models:** lists `.ferrite` files in `./models` (or open one with *Browse…*). It reopens the last
-  model on start and defaults to `qwen3.5-2b-q6`.
-* **Chat:** answers stream with markdown and syntax-highlighted code. Math the model writes in LaTeX
-  is shown as ×, ≤, √, and so on. Reasoning goes in a collapsible *Thoughts* section.
-* **Per-reply stats:** tok/s, prompt and cached tokens, draft acceptance, and time to first token.
-  There are Copy and Regenerate buttons.
-* **Settings** (saved across runs): MTP speculation, thinking mode, temperature, top-p, top-k,
-  min-p, presence penalty, max tokens, seed, system prompt, threads, context size, dark/light theme.
-* **Shortcuts:** start a message with `/think` or `/nothink` to switch thinking mode on the fly.
-  Enter sends, Shift+Enter adds a new line.
-* **Engine thread:** the engine runs on its own thread, so the UI stays responsive, and Stop takes
-  effect at the next token. Follow-up turns resume from a state snapshot instead of re-reading
-  the conversation.
-
-Building the GUI needs a 64-bit MinGW `dlltool` (see *Notes for this machine*).
+Fonts, KaTeX, marked and highlight.js are vendored under `app/ui/vendor/`, so the app runs fully
+offline. On the windows-gnu target, `app/build.rs` copies `WebView2Loader.dll` next to the exe.
 
 ### HTTP API
 
@@ -260,9 +276,10 @@ cargo run --release --example bw_bench       # memory bandwidth ceiling
 ## Notes for this machine
 
 * The system `C:\MinGW` is a 32-bit GCC 6.3 toolchain whose `dlltool`/`as` shadow the 64-bit ones
-  that raw-dylib import libraries (windows-sys, used by the GUI crates) need. WinLibs MinGW-w64 is
+  that raw-dylib import libraries (windows-sys, used by Tauri) need. WinLibs MinGW-w64 is
   installed (`winget install BrechtSanders.WinLibs.POSIX.UCRT`), and `.cargo/config.toml` points
-  rustc at its `dlltool`, which finds its own 64-bit `as.exe` next to it.
+  rustc at its `dlltool`, which finds its own 64-bit `as.exe` next to it. Tauri's `windres`
+  is looked up on PATH only, so builds put WinLibs `bin` first (`chat.cmd` does this).
 * Windows cannot overwrite a file that a running process has memory-mapped. Don't convert onto a
   `.ferrite` file that a running `ferrite` is using.
 

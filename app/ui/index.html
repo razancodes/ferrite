@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en" data-theme="ink" data-motion="on">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ferrite chat</title>
+<link rel="stylesheet" href="vendor/katex/katex.min.css">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<canvas id="field" aria-hidden="true"></canvas>
+<div class="vignette" aria-hidden="true"></div>
+<div class="grain" aria-hidden="true"></div>
+<div class="progress" id="progress" aria-hidden="true"><span></span></div>
+
+<header class="topbar">
+  <div class="crumb"><b>FERRITE</b><span class="sep">/</span><span id="crumb-model">CHAT</span></div>
+  <nav class="toggles" aria-label="Settings">
+    <button class="tog" id="t-think" title="Reason step by step before answering (or start a message with /think)"><span class="k">THINK</span><i data-v="on">ON</i>/<i data-v="off">OFF</i></button>
+    <button class="tog" id="t-spec" title="Self-speculative decoding with the model's MTP head — same output, faster"><span class="k">SPEC</span><i data-v="on">ON</i>/<i data-v="off">OFF</i></button>
+    <button class="tog" id="t-motion" title="Animated dither field"><span class="k">MOTION</span><i data-v="on">ON</i>/<i data-v="off">OFF</i></button>
+    <button class="tog" id="t-theme" title="Theme"><i data-v="ink">INK</i>/<i data-v="paper">PAPER</i></button>
+    <button class="tog" id="t-new" title="New chat (Ctrl+N)"><span class="kbd">NEW CHAT</span></button>
+  </nav>
+</header>
+
+<div class="frame">
+  <aside class="side" aria-label="Model and settings">
+    <div class="sh"><span class="i">01</span><span class="l">Model</span><span class="r"></span><span class="x" id="model-count"></span></div>
+    <div class="ledger" id="models"></div>
+    <div class="side-actions">
+      <button class="btn-rule" id="browse">Browse <span class="arrow">↗</span></button>
+      <button class="btn-rule" id="rescan">Rescan</button>
+    </div>
+
+    <div class="sh"><span class="i">02</span><span class="l">Sampling</span><span class="r"></span><button class="x" id="defaults" title="Qwen's recommended settings">Reset</button></div>
+    <div class="ledger" id="sampling"></div>
+
+    <div class="sh"><span class="i">03</span><span class="l">System</span><span class="r"></span></div>
+    <textarea class="sys" id="system" placeholder="Optional system prompt, e.g. “You are a concise assistant.”"></textarea>
+
+    <div class="sh"><span class="i">04</span><span class="l">Machine</span><span class="r"></span><span class="x" id="isa"></span></div>
+    <div class="machine" id="machine">
+      <div class="figcap"><span class="label">Fig. 1 — throughput</span><span class="label" id="fig-state">idle</span></div>
+      <div class="big"><span class="n" id="tps">—</span><span class="u">tok / s</span></div>
+      <canvas id="spark" width="132" height="27" aria-hidden="true"></canvas>
+      <div class="figcap"><span class="label" id="spark-l">last reply</span><span class="label" id="accept"></span></div>
+      <dl class="kv" id="kv"></dl>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="scroll" id="scroll">
+      <div class="col">
+        <section class="hero" id="hero">
+          <div class="hero-grid">
+            <div class="hero-text">
+              <div class="eyebrow">Local inference · CPU · offline</div>
+              <h1>Ask anything,<br><em>locally.</em></h1>
+              <p class="lede">Qwen3.5 running on ferrite — a from-scratch Rust engine with AVX-512 kernels and speculative decoding.</p>
+              <div class="status" id="hero-status"><span class="chip dim">no model</span></div>
+            </div>
+            <figure class="fig" aria-hidden="true">
+              <div class="figcap"><span class="label">Fig. 0 — loss landscape</span><span class="label">8×8 Bayer</span></div>
+              <div class="plate"><canvas id="fig0"></canvas></div>
+              <div class="figcap"><span class="label">amp 1.00</span><span class="label">cursor = perturbation</span></div>
+            </figure>
+          </div>
+          <div class="ledger prompts" id="prompts"></div>
+        </section>
+        <ol id="log" aria-live="polite"></ol>
+      </div>
+    </div>
+    <form class="composer" id="composer" autocomplete="off">
+      <div class="col">
+        <div class="lbl"><span class="label" id="ctx-label">prompt</span><span class="label" id="ctx-use"></span></div>
+        <div class="box">
+          <textarea id="input" rows="1" placeholder="Message the model…" disabled></textarea>
+          <button type="submit" class="btn-rule send" id="send" disabled>Send <span class="arrow arrow-r">→</span></button>
+        </div>
+        <div class="hint"><span class="label">Enter — send</span><span class="label">Shift + Enter — new line</span><span class="label">/think · /nothink</span><span class="label">Ctrl + N — new chat</span></div>
+      </div>
+    </form>
+  </main>
+</div>
+
+<div class="toast" id="toast" role="status"></div>
+
+<script src="vendor/marked.umd.js"></script>
+<script src="vendor/katex/katex.min.js"></script>
+<script src="vendor/highlight.min.js"></script>
+<script src="field.js"></script>
+<script src="markdown.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,16 +1,18 @@
-//! The engine runs on its own thread so the UI never blocks: the UI sends
-//! commands, the worker streams events back and asks egui to repaint.
+//! The engine lives on its own thread; the UI talks to it through commands
+//! and receives a stream of `engine` events (loading, deltas, stats).
 
 use ferrite::chat::{ChatTemplate, Message};
-use ferrite::engine::{DRAFT_VOCAB, Engine, GenStats};
+use ferrite::engine::{DRAFT_VOCAB, Engine, GenStats, StopReason};
 use ferrite::sampler::{Sampler, SamplerConfig};
 use ferrite::stream::TextRouter;
 use ferrite::tokenizer::StreamDecoder;
+use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Instant;
+use tauri::{AppHandle, Emitter};
 
 pub enum Cmd {
     Load { path: PathBuf, threads: usize, ctx: usize, spec: bool },
@@ -19,9 +21,10 @@ pub enum Cmd {
     Reset,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ModelInfo {
     pub name: String,
+    pub path: String,
     pub layers: usize,
     pub linear_layers: usize,
     pub attn_layers: usize,
@@ -38,38 +41,54 @@ pub struct ModelInfo {
     pub load_secs: f64,
 }
 
-pub enum Event {
-    Loading(String),
-    Loaded(ModelInfo),
-    LoadFailed(String),
-    SpecChanged(bool),
-    /// streamed text; `tokens` = tokens generated so far in this reply
-    Delta { reasoning: bool, text: String, tokens: usize },
-    Done { stats: GenStats, context_used: usize },
-    Failed(String),
+#[derive(Clone, Debug, Serialize)]
+pub struct DoneStats {
+    pub prompt_tokens: usize,
+    pub cached_tokens: usize,
+    pub prefill_tps: f64,
+    pub gen_tokens: usize,
+    pub gen_tps: f64,
+    pub drafted: usize,
+    pub accepted: usize,
+    pub acceptance: f64,
+    pub ttft_ms: f64,
+    pub stop: &'static str,
+    pub context_used: usize,
 }
 
-pub fn spawn(ui: eframe::egui::Context, stop: Arc<AtomicBool>) -> (Sender<Cmd>, Receiver<Event>) {
-    let (cmd_tx, cmd_rx) = channel();
-    let (ev_tx, ev_rx) = channel();
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Event {
+    Loading { name: String },
+    Loaded { info: ModelInfo },
+    LoadFailed { error: String },
+    SpecChanged { on: bool },
+    /// the prompt is being read (`tokens` new tokens, `cached` reused)
+    Prefill { tokens: usize },
+    Delta { reasoning: bool, text: String, tokens: usize },
+    Done { stats: DoneStats },
+    Failed { error: String },
+}
+
+pub fn spawn(app: AppHandle, stop: Arc<AtomicBool>) -> Sender<Cmd> {
+    let (tx, rx) = channel();
     std::thread::Builder::new()
         .name("ferrite-engine".into())
-        .spawn(move || run(cmd_rx, ev_tx, ui, stop))
+        .spawn(move || run(rx, app, stop))
         .expect("spawn engine thread");
-    (cmd_tx, ev_rx)
+    tx
 }
 
-fn run(rx: Receiver<Cmd>, tx: Sender<Event>, ui: eframe::egui::Context, stop: Arc<AtomicBool>) {
+fn run(rx: Receiver<Cmd>, app: AppHandle, stop: Arc<AtomicBool>) {
     let send = |e: Event| {
-        let _ = tx.send(e);
-        ui.request_repaint();
+        let _ = app.emit("engine", e);
     };
     let mut engine: Option<Engine> = None;
     while let Ok(cmd) = rx.recv() {
         match cmd {
             Cmd::Load { path, threads, ctx, spec } => {
                 let name = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-                send(Event::Loading(name.clone()));
+                send(Event::Loading { name: name.clone() });
                 drop(engine.take()); // release the previous model's memory first
                 let t0 = Instant::now();
                 match Engine::load(&path, threads, ctx) {
@@ -79,6 +98,7 @@ fn run(rx: Receiver<Cmd>, tx: Sender<Event>, ui: eframe::egui::Context, stop: Ar
                         let meta = &e.model.file.header.meta;
                         let info = ModelInfo {
                             name,
+                            path: path.display().to_string(),
                             layers: c.n_layers,
                             linear_layers: c.n_linear(),
                             attn_layers: c.n_full(),
@@ -95,9 +115,9 @@ fn run(rx: Receiver<Cmd>, tx: Sender<Event>, ui: eframe::egui::Context, stop: Ar
                             load_secs: t0.elapsed().as_secs_f64(),
                         };
                         engine = Some(e);
-                        send(Event::Loaded(info));
+                        send(Event::Loaded { info });
                     }
-                    Err(err) => send(Event::LoadFailed(format!("{err:#}"))),
+                    Err(err) => send(Event::LoadFailed { error: format!("{err:#}") }),
                 }
             }
             Cmd::SetSpec(on) => {
@@ -109,7 +129,7 @@ fn run(rx: Receiver<Cmd>, tx: Sender<Event>, ui: eframe::egui::Context, stop: Ar
                         e.reset();
                         false
                     };
-                    send(Event::SpecChanged(now));
+                    send(Event::SpecChanged { on: now });
                 }
             }
             Cmd::Reset => {
@@ -119,12 +139,34 @@ fn run(rx: Receiver<Cmd>, tx: Sender<Event>, ui: eframe::egui::Context, stop: Ar
             }
             Cmd::Generate { messages, thinking, sampler, max_tokens } => {
                 let Some(e) = engine.as_mut() else {
-                    send(Event::Failed("no model loaded".into()));
+                    send(Event::Failed { error: "No model is loaded.".into() });
                     continue;
                 };
                 match generate(e, &messages, thinking, sampler, max_tokens, &stop, &send) {
-                    Ok(stats) => send(Event::Done { stats, context_used: e.pos() }),
-                    Err(err) => send(Event::Failed(format!("{err:#}"))),
+                    Ok((stats, ttft)) => {
+                        let stop_reason = match stats.stop {
+                            StopReason::Eos => "eos",
+                            StopReason::Length => "length",
+                            StopReason::Callback => "stopped",
+                            StopReason::Context => "context",
+                        };
+                        send(Event::Done {
+                            stats: DoneStats {
+                                prompt_tokens: stats.prompt_tokens,
+                                cached_tokens: stats.cached_tokens,
+                                prefill_tps: stats.prefill_tps(),
+                                gen_tokens: stats.gen_tokens,
+                                gen_tps: stats.gen_tps(),
+                                drafted: stats.drafted,
+                                accepted: stats.accepted,
+                                acceptance: stats.acceptance(),
+                                ttft_ms: ttft * 1e3,
+                                stop: stop_reason,
+                                context_used: e.pos(),
+                            },
+                        })
+                    }
+                    Err(err) => send(Event::Failed { error: format!("{err:#}") }),
                 }
             }
         }
@@ -139,7 +181,8 @@ fn generate(
     max_tokens: usize,
     stop: &AtomicBool,
     send: &dyn Fn(Event),
-) -> anyhow::Result<GenStats> {
+) -> anyhow::Result<(GenStats, f64)> {
+    let t0 = Instant::now();
     let (prompt, head, eos) = {
         let tok = &e.model.tokenizer;
         let tmpl = ChatTemplate::new(tok);
@@ -150,16 +193,18 @@ fn generate(
     };
     if prompt.len() + 16 >= e.state.max_ctx {
         anyhow::bail!(
-            "conversation is too long for the context window ({} tokens, limit {}). Start a new chat or raise the context size.",
+            "The conversation is too long for the context window ({} tokens, limit {}). Start a new chat or raise the context size.",
             prompt.len(),
             e.state.max_ctx
         );
     }
+    send(Event::Prefill { tokens: prompt.len() });
     let max_new = max_tokens.min(e.state.max_ctx - prompt.len() - 1);
     let mut sampler = Sampler::new(sampler);
     let mut dec = StreamDecoder::default();
     let mut router = TextRouter::new(thinking, Vec::new());
     let mut n = 0usize;
+    let mut ttft = None;
     let emit = |kind: &str, text: &str, n: usize| {
         send(Event::Delta { reasoning: kind == "reasoning_content", text: text.to_string(), tokens: n });
         true
@@ -167,6 +212,9 @@ fn generate(
     let stats = e.generate(&prompt, Some(head), &mut sampler, max_new, &eos, |eng, t| {
         if stop.load(Ordering::Relaxed) {
             return false;
+        }
+        if ttft.is_none() {
+            ttft = Some(t0.elapsed().as_secs_f64());
         }
         n += 1;
         let piece = dec.push(&eng.model.tokenizer, t);
@@ -177,5 +225,5 @@ fn generate(
         router.push(&tail, &mut |k, s| emit(k, s, n));
     }
     router.finish(&mut |k, s| emit(k, s, n));
-    Ok(stats)
+    Ok((stats, ttft.unwrap_or(0.0)))
 }

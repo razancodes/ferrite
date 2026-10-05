@@ -4,3 +4,6 @@
 /scratch
 __pycache__/
 /data
+
+# Tauri build output
+app/gen/
