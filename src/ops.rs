@@ -69,6 +69,29 @@ pub fn softplus(x: f32) -> f32 {
     if x > 20.0 { x } else { x.exp().ln_1p() }
 }
 
+pub fn max_f32(x: &[f32]) -> f32 {
+    if isa() == Isa::Avx512Vnni {
+        return unsafe { vmath::max_f32(x) };
+    }
+    x.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b))
+}
+
+/// Mark every 16-wide group of `x` that holds a value >= `thr`; returns the
+/// number of qualifying groups.
+pub fn mark_groups_ge(x: &[f32], thr: f32, mark: &mut [bool]) -> usize {
+    if isa() == Isa::Avx512Vnni {
+        return unsafe { vmath::mark_groups_ge(x, thr, mark) };
+    }
+    let mut hits = 0;
+    for (g, m) in mark.iter_mut().enumerate().take(x.len() / 16) {
+        if x[g * 16..(g + 1) * 16].iter().any(|&v| v >= thr) {
+            *m = true;
+            hits += 1;
+        }
+    }
+    hits
+}
+
 /// x[i] = exp(x[i] - m), returning the sum
 #[inline]
 pub fn exp_sub_sum(x: &mut [f32], m: f32) -> f32 {

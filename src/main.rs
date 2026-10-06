@@ -334,6 +334,8 @@ fn load_engine_opts(m: &ModelArgs, generation: bool) -> Result<Engine> {
     if generation && !m.no_spec {
         e.enable_spec(m.draft_vocab)?;
     }
+    // analysis tools (perplexity, KL, logit dumps, imatrix) need the exact full distribution
+    e.fast_head &= generation;
     let c = &e.model.cfg;
     eprintln!(
         "[ferrite] {} | {} layers ({} DeltaNet + {} attn) | {:.2} GB weights | {} threads | {} | MTP speculation {} | loaded in {:.2}s",

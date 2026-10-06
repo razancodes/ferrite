@@ -169,6 +169,24 @@ pub fn matmul_q(pool: &ThreadPool, w: &QMat, qa: &QActs, out: &mut [f32]) {
     });
 }
 
+/// Like `matmul_q`, but only for the listed 16-row groups: rows outside them in
+/// `out` (laid out [t, w.rows]) are left untouched.
+pub fn matmul_q_groups(pool: &ThreadPool, w: &QMat, qa: &QActs, groups: &[usize], out: &mut [f32]) {
+    assert!(out.len() >= qa.t * w.rows);
+    let op = SyncPtr::new(out);
+    let isa = isa();
+    pool.par_chunks(groups.len(), 1, |lo, hi| {
+        for &g in &groups[lo..hi] {
+            unsafe {
+                match isa {
+                    Isa::Avx512Vnni => avx512::gemm(w, qa, g, g + 1, op.get()),
+                    Isa::Scalar => scalar::gemm(w, qa, g, g + 1, op.get()),
+                }
+            }
+        }
+    });
+}
+
 fn matmul_f32(pool: &ThreadPool, w: &QMat, x: &[f32], t: usize, out: &mut [f32]) {
     let k = w.k;
     let rows = w.rows;

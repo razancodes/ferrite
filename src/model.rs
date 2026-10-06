@@ -67,13 +67,23 @@ pub struct DraftHead {
     pub mat: QMat,
     pub ids: Vec<u32>,
     _buf: Vec<u8>,
+    /// With a proxy LM head, `mat` holds its low-bit rows and `exact` the same
+    /// rows of the exact head: drafts scan with `mat` and re-score the shortlist
+    /// (draft acceptance is sensitive to head precision: 60% vs 56% at 0.8B)
+    exact: Option<(QMat, Vec<u8>)>,
 }
+
+/// Shortlist window for the draft head (only its argmax matters).
+const DRAFT_DELTA: f32 = 4.0;
 
 pub struct Model {
     pub draft: Option<DraftHead>,
     pub cfg: Config,
     pub file: ModelFile,
     pub lm_head: QMat,
+    /// Optional low-bit copy of the LM head used to shortlist candidate tokens
+    /// during generation; the shortlist is then scored exactly with `lm_head`.
+    pub lm_proxy: Option<QMat>,
     pub embed: Option<QMat>,
     pub final_norm: FSlice,
     pub layers: Vec<LayerW>,
@@ -124,6 +134,9 @@ pub struct Scratch {
     cat: Vec<f32>,
     qa: QActs,
     pub logits: Vec<f32>,
+    marks: Vec<bool>,
+    row_marks: Vec<bool>,
+    groups: Vec<usize>,
 }
 
 fn resize(v: &mut Vec<f32>, n: usize) {
@@ -227,6 +240,7 @@ impl Model {
         Ok(Model {
             draft: None,
             lm_head: mat("lm_head")?,
+            lm_proxy: if file.info("lm_proxy").is_some() { Some(mat("lm_proxy")?) } else { None },
             embed: if file.info("embed").is_some() { Some(mat("embed")?) } else { None },
             final_norm: vecf("final_norm")?,
             layers,
@@ -262,13 +276,15 @@ impl Model {
     }
 
     /// Bytes streamed from memory for one decoded token (all weights except the
-    /// embedding table and the MTP head).
+    /// embedding table and the MTP head; with a proxy head, the proxy instead of
+    /// the full LM head, whose shortlisted rows are a negligible read).
     pub fn decode_bytes(&self) -> usize {
+        let skip_head = if self.lm_proxy.is_some() { "lm_head" } else { "lm_proxy" };
         self.file
             .header
             .tensors
             .iter()
-            .filter(|t| t.name != "tokenizer.json" && t.name != "embed" && !t.name.starts_with("mtp."))
+            .filter(|t| t.name != "tokenizer.json" && t.name != "embed" && t.name != skip_head && !t.name.starts_with("mtp."))
             .map(|t| t.nbytes as usize)
             .sum()
     }
@@ -317,13 +333,23 @@ impl Model {
         ids.retain(|i| !extra.contains(i) && (*i as usize) < vocab);
         ids.truncate(n - extra.len());
         ids.append(&mut extra);
-        let mut buf = crate::quant::gather_rows(self.lm_head.bytes(), self.lm_head.dtype, self.lm_head.k, &ids);
-        // Optionally re-quantize the draft head to a smaller format: drafting only
-        // needs the right argmax, and the head is half of each draft step's bytes.
+        let k = self.lm_head.k;
+        let view = |dtype: DType, buf: &Vec<u8>, rot: usize| QMat { dtype, rows: ids.len(), k, ptr: buf.as_ptr(), len: buf.len(), id: usize::MAX, rot };
+        // With a proxy head: scan the draft vocabulary with its low-bit rows and
+        // re-score the shortlist with the exact rows (FERRITE_DRAFT_FROM=head: exact only)
+        let use_proxy = std::env::var("FERRITE_DRAFT_FROM").map(|v| v != "head").unwrap_or(true);
+        if let Some(p) = self.lm_proxy.filter(|_| use_proxy && self.lm_head.dtype != DType::F32) {
+            let buf = crate::quant::gather_rows(p.bytes(), p.dtype, k, &ids);
+            let ebuf = crate::quant::gather_rows(self.lm_head.bytes(), self.lm_head.dtype, k, &ids);
+            let (mat, emat) = (view(p.dtype, &buf, p.rot), view(self.lm_head.dtype, &ebuf, self.lm_head.rot));
+            self.draft = Some(DraftHead { mat, ids, _buf: buf, exact: Some((emat, ebuf)) });
+            return Ok(());
+        }
+        let mut buf = crate::quant::gather_rows(self.lm_head.bytes(), self.lm_head.dtype, k, &ids);
+        // Optionally re-quantize the draft head to a smaller format
         let mut dtype = self.lm_head.dtype;
         if let Some(dt) = std::env::var("FERRITE_DRAFT_Q").ok().and_then(|v| DType::parse(&v)) {
             if dt != dtype && dt != DType::F32 {
-                let k = self.lm_head.k;
                 let mut w = vec![0f32; ids.len() * k];
                 for (i, row) in w.chunks_exact_mut(k).enumerate() {
                     crate::quant::dequantize_row(&buf, dtype, k, i, row);
@@ -332,16 +358,8 @@ impl Model {
                 dtype = dt;
             }
         }
-        let mat = QMat {
-            dtype,
-            rows: ids.len(),
-            k: self.lm_head.k,
-            ptr: buf.as_ptr(),
-            len: buf.len(),
-            id: usize::MAX,
-            rot: self.lm_head.rot,
-        };
-        self.draft = Some(DraftHead { mat, ids, _buf: buf });
+        let mat = view(dtype, &buf, self.lm_head.rot);
+        self.draft = Some(DraftHead { mat, ids, _buf: buf, exact: None });
         Ok(())
     }
 
@@ -438,9 +456,14 @@ impl Model {
         if logits {
             let draft = self.draft.as_ref().context("draft head not built")?;
             rmsnorm(&sc.x[(t - 1) * h..t * h], mtp.final_norm, eps, &mut sc.xn[..h]);
-            resize(&mut sc.logits, draft.mat.rows);
             let xn = std::mem::take(&mut sc.xn);
-            matmul(pool, &draft.mat, &xn, 1, &mut sc.logits, &mut sc.qa);
+            match &draft.exact {
+                Some((ex, _)) => shortlist_matmul(pool, &draft.mat, ex, &xn[..h], 1, ex.rows, DRAFT_DELTA, 64, sc),
+                None => {
+                    resize(&mut sc.logits, draft.mat.rows);
+                    matmul(pool, &draft.mat, &xn, 1, &mut sc.logits, &mut sc.qa);
+                }
+            }
             sc.xn = xn;
         }
         Ok(())
@@ -902,8 +925,71 @@ impl Model {
         }
     }
 
+    /// Like `logits`, but the whole vocabulary is scored with the low-bit proxy
+    /// head and only the shortlist is scored exactly (see `shortlist_matmul`).
+    /// Without a proxy this is `logits`.
+    pub fn logits_shortlist(&self, pool: &ThreadPool, sc: &mut Scratch, first: usize, n: usize, delta: f32, cap: usize) {
+        let Some(proxy) = self.lm_proxy.as_ref().filter(|_| self.lm_head.dtype != DType::F32) else {
+            return self.logits(pool, sc, first, n);
+        };
+        let h = self.cfg.hidden;
+        resize(&mut sc.xn, n * h);
+        for i in 0..n {
+            let src = &sc.x[(first + i) * h..(first + i + 1) * h];
+            rmsnorm(src, self.final_norm, self.cfg.rms_eps, &mut sc.xn[i * h..(i + 1) * h]);
+        }
+        let xn = std::mem::take(&mut sc.xn);
+        let tv = self.tokenizer.vocab_size().min(self.lm_head.rows);
+        shortlist_matmul(pool, proxy, &self.lm_head, &xn, n, tv, delta, cap, sc);
+        sc.xn = xn;
+    }
+
     pub fn vocab_rows(&self) -> usize {
         self.lm_head.rows
+    }
+}
+
+/// `sc.logits[n, exact.rows] = x[n, k] @ exact^T`, computed cheaply: the low-bit
+/// `proxy` (same rows as `exact`) scores every row, then only the 16-row groups
+/// holding a proxy value within `delta` of that output row's maximum (at most
+/// `cap` groups per row; `delta` halves until they fit) are re-scored with
+/// `exact`. Those outputs are exact, the rest keep proxy values far below the
+/// top. Outputs from `valid` on are masked to -inf.
+#[allow(clippy::too_many_arguments)]
+fn shortlist_matmul(pool: &ThreadPool, proxy: &QMat, exact: &QMat, x: &[f32], n: usize, valid: usize, delta: f32, cap: usize, sc: &mut Scratch) {
+    let v = exact.rows;
+    let ng = v / crate::quant::GROUP;
+    resize(&mut sc.logits, n * v);
+    {
+        let _p = scope("lm_proxy");
+        matmul(pool, proxy, x, n, &mut sc.logits, &mut sc.qa);
+    }
+    let _p = scope("lm_shortlist");
+    sc.marks.clear();
+    sc.marks.resize(ng, false);
+    for i in 0..n {
+        let row = &mut sc.logits[i * v..(i + 1) * v];
+        row[valid..].fill(f32::NEG_INFINITY);
+        let mx = ops::max_f32(row);
+        let mut d = delta;
+        loop {
+            sc.row_marks.clear();
+            sc.row_marks.resize(ng, false);
+            if ops::mark_groups_ge(row, mx - d, &mut sc.row_marks) <= cap || d < 0.05 {
+                break;
+            }
+            d *= 0.5;
+        }
+        for (m, &r) in sc.marks.iter_mut().zip(&sc.row_marks) {
+            *m |= r;
+        }
+    }
+    sc.groups.clear();
+    sc.groups.extend((0..ng).filter(|&g| sc.marks[g]));
+    crate::kernels::quantize_acts_into(pool, x, n, exact.k, exact.rot, &mut sc.qa);
+    crate::kernels::matmul_q_groups(pool, exact, &sc.qa, &sc.groups, &mut sc.logits);
+    for i in 0..n {
+        sc.logits[i * v + valid..(i + 1) * v].fill(f32::NEG_INFINITY);
     }
 }
 
@@ -981,5 +1067,43 @@ pub unsafe fn delta_rule_step(
             unsafe { *dst.add(i * dv + j) = x };
             o[j] += x * qi;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::quant::quantize_matrix;
+
+    #[test]
+    fn shortlist_matches_exact_head_on_the_shortlist() {
+        let pool = ThreadPool::new(4);
+        let (rows, k, n) = (512, 256, 3);
+        let mut s = 7u64;
+        let mut rnd = |scale: f32| {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((s >> 33) as f32 / (1u64 << 31) as f32 - 0.5) * scale
+        };
+        let w: Vec<f32> = (0..rows * k).map(|_| rnd(0.2)).collect();
+        let x: Vec<f32> = (0..n * k).map(|_| rnd(2.0)).collect();
+        let (eb, pb) = (quantize_matrix(&w, rows, k, DType::Q8R, None), quantize_matrix(&w, rows, k, DType::Q4R, None));
+        let m = |dtype, b: &Vec<u8>| QMat { dtype, rows, k, ptr: b.as_ptr(), len: b.len(), id: usize::MAX, rot: 0 };
+        let (exact, proxy) = (m(DType::Q8R, &eb), m(DType::Q4R, &pb));
+        let mut want = vec![0f32; n * rows];
+        matmul(&pool, &exact, &x, n, &mut want, &mut QActs::default());
+        let mut sc = Scratch::default();
+        shortlist_matmul(&pool, &proxy, &exact, &x, n, rows - 16, 2.0, 8, &mut sc);
+        for i in 0..n {
+            let (got, w) = (&sc.logits[i * rows..(i + 1) * rows], &want[i * rows..(i + 1) * rows]);
+            assert!(got[rows - 16..].iter().all(|v| *v == f32::NEG_INFINITY), "padding masked");
+            let am = |r: &[f32]| (0..rows - 16).max_by(|a, b| r[*a].total_cmp(&r[*b])).unwrap();
+            assert_eq!(am(got), am(w), "row {i}: argmax");
+            for g in sc.groups.iter().filter(|&&g| g < (rows - 16) / 16) {
+                for r in g * 16..g * 16 + 16 {
+                    assert_eq!(got[r], w[r], "row {i}: shortlisted output {r} is exact");
+                }
+            }
+        }
+        assert!(sc.groups.len() < rows / 16, "the shortlist is a strict subset");
     }
 }

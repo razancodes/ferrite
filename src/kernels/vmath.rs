@@ -299,6 +299,42 @@ pub unsafe fn sum_sq(x: &[f32]) -> f32 {
     }
 }
 
+#[target_feature(enable = "avx512f")]
+pub unsafe fn max_f32(x: &[f32]) -> f32 {
+    let n = x.len();
+    let mut i = 0;
+    unsafe {
+        let mut a0 = _mm512_set1_ps(f32::NEG_INFINITY);
+        let mut a1 = a0;
+        while i + 32 <= n {
+            a0 = _mm512_max_ps(a0, _mm512_loadu_ps(x.as_ptr().add(i)));
+            a1 = _mm512_max_ps(a1, _mm512_loadu_ps(x.as_ptr().add(i + 16)));
+            i += 32;
+        }
+        let mut m = _mm512_reduce_max_ps(_mm512_max_ps(a0, a1));
+        for &v in &x[i..] {
+            m = m.max(v);
+        }
+        m
+    }
+}
+
+/// For each 16-float group of `x` (`x.len()` a multiple of 16) holding a value
+/// >= `thr`, set `mark[group]`; returns how many groups qualified.
+#[target_feature(enable = "avx512f")]
+pub unsafe fn mark_groups_ge(x: &[f32], thr: f32, mark: &mut [bool]) -> usize {
+    let t = _mm512_set1_ps(thr);
+    let mut hits = 0;
+    for (g, m) in mark.iter_mut().enumerate().take(x.len() / 16) {
+        let v = unsafe { _mm512_loadu_ps(x.as_ptr().add(g * 16)) };
+        if _mm512_cmp_ps_mask::<_CMP_GE_OQ>(v, t) != 0 {
+            *m = true;
+            hits += 1;
+        }
+    }
+    hits
+}
+
 /// Randomized Hadamard rotation of 256-element blocks (see `quant::rotate`):
 /// sign flip, then a normalized Walsh-Hadamard transform held entirely in 16
 /// zmm registers. Stages within a register use lane permutes; stages across

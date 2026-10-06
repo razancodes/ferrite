@@ -27,6 +27,10 @@ pub struct Recipe {
     /// rotation lowers KL by 30-40% for 8/6-bit but raises it for 4-bit, where
     /// imatrix-weighted rounding of salient channels matters more)
     pub rotate: bool,
+    /// Also store a low-bit copy of the LM head (`lm_proxy`) that generation
+    /// reads for every token, scoring only its shortlist with the exact head.
+    /// At 0.8B the 8-bit head is ~47% of the bytes per token.
+    pub proxy: Option<DType>,
 }
 
 impl Recipe {
@@ -48,13 +52,19 @@ impl Recipe {
             "q4-fast" => (DType::Q4R, vec![q8("in_ba")], false),
             _ => bail!("unknown quantization recipe '{base}' (f32 | q8 | q6 | q4 | q4-fast)"),
         };
+        // every quantized recipe gets a 4-bit proxy head unless its head is already 4-bit
+        let mut proxy = (base != "f32" && base != "q4-fast").then_some(DType::Q4R);
         for p in parts {
             let (k, v) = p.split_once('=').with_context(|| format!("bad override '{p}'"))?;
+            if k.trim() == "lm_proxy" {
+                proxy = if v.trim() == "none" { None } else { Some(DType::parse(v.trim()).with_context(|| format!("bad dtype '{v}'"))?) };
+                continue;
+            }
             let dt = DType::parse(v.trim()).with_context(|| format!("bad dtype '{v}'"))?;
             overrides.retain(|(c, _)| c != k.trim());
             overrides.push((k.trim().to_string(), dt));
         }
-        Ok(Recipe { default, overrides, rotate })
+        Ok(Recipe { default, overrides, rotate, proxy })
     }
 
     /// Keys: a class (`down`), a class in one layer (`down@3`), the whole MTP
@@ -105,8 +115,13 @@ impl Ctx<'_> {
     /// Quantize and write a matrix built by stacking `parts` (each [rows_i, k]).
     /// Takes ownership so a single part is used without copying (the f32
     /// embedding of a 4B model alone is 2.5 GB).
-    fn matrix(&mut self, out_name: &str, mut parts: Vec<Vec<f32>>, k: usize) -> Result<()> {
+    fn matrix(&mut self, out_name: &str, parts: Vec<Vec<f32>>, k: usize) -> Result<()> {
         let dt = self.recipe.dtype_for(out_name);
+        self.matrix_as(out_name, parts, k, dt, self.rotate, out_name)
+    }
+
+    /// `matrix` with an explicit dtype, rotation choice and imatrix entry.
+    fn matrix_as(&mut self, out_name: &str, mut parts: Vec<Vec<f32>>, k: usize, dt: DType, rotate: bool, imp_key: &str) -> Result<()> {
         for p in &parts {
             assert_eq!(p.len() % k, 0);
         }
@@ -123,7 +138,7 @@ impl Ctx<'_> {
         let mut w = w;
         // Hadamard-rotate the input dimension of every quantized matrix (rows of
         // a rotated embedding are un-rotated when looked up)
-        let rot = if self.rotate && dt != DType::F32 {
+        let rot = if rotate && dt != DType::F32 {
             crate::quant::rot_block(k)
         } else {
             0
@@ -136,7 +151,7 @@ impl Ctx<'_> {
         if !nrows.is_multiple_of(16) {
             bail!("{out_name}: {nrows} rows is not a multiple of 16");
         }
-        let mut imp: Option<Vec<f32>> = self.imatrix.as_ref().and_then(|m| m.get(out_name)).cloned();
+        let mut imp: Option<Vec<f32>> = self.imatrix.as_ref().and_then(|m| m.get(imp_key)).cloned();
         if let Some(v) = imp.as_mut() {
             if rot > 1 && !self.imatrix_rotated {
                 // stats from an unrotated model: in rotated space each column of a
@@ -150,7 +165,9 @@ impl Ctx<'_> {
             }
         }
         let q = quantize_matrix(&w, nrows, k, dt, imp.as_deref());
-        self.total_params += nrows * k;
+        if out_name != "lm_proxy" {
+            self.total_params += nrows * k; // the proxy duplicates the head's parameters
+        }
         self.total_bytes += q.len();
         self.w.add(out_name, dt, &[nrows, k], &q)?;
         if rot > 1 {
@@ -255,12 +272,18 @@ pub fn convert(hf_dir: &Path, out: &Path, recipe_name: &str, imatrix: Option<&Pa
     // Embedding / LM head
     let (emb, eshape) = cx.load(&format!("{prefix}.embed_tokens.weight"))?;
     let vocab_rows = eshape[0];
+    let head_src = if cfg.tie_embeddings { format!("{prefix}.embed_tokens.weight") } else { "lm_head.weight".to_string() };
     if cfg.tie_embeddings {
         cx.matrix("lm_head", vec![emb], h)?;
     } else {
         cx.matrix("embed", vec![emb], h)?;
         let (lm, _) = cx.load("lm_head.weight")?;
         cx.matrix("lm_head", vec![lm], h)?;
+    }
+    if let Some(pdt) = recipe.proxy.filter(|&p| p != recipe.dtype_for("lm_head")) {
+        // unrotated: rotation hurts at 4 bits (see `Recipe::rotate`)
+        let (w, _) = cx.load(&head_src)?;
+        cx.matrix_as("lm_proxy", vec![w], h, pdt, false, "lm_head")?;
     }
     cx.norm("final_norm", &format!("{prefix}.norm.weight"), offset)?;
 

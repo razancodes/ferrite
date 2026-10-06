@@ -28,6 +28,13 @@ pub struct Engine {
     pub draft_k: usize,
     /// keep chaining drafts only while the MTP head's top probability is at least this
     pub draft_conf: f32,
+    /// generation scores the vocabulary with the proxy LM head (when the model
+    /// has one) and only the shortlist within `head_delta` logits of the top
+    /// exactly (at most `head_cap` 16-token groups per position); tools that
+    /// need the exact full distribution (perplexity, logit dumps) turn this off
+    pub fast_head: bool,
+    pub head_delta: f32,
+    pub head_cap: usize,
     last_logits: Vec<f32>,
     /// `last_logits` belong to the current end of the sequence
     logits_fresh: bool,
@@ -121,6 +128,9 @@ impl Engine {
             decode_threads: default_decode_threads(threads),
             draft_k: env_or("FERRITE_DRAFT_K", 4usize),
             draft_conf: env_or("FERRITE_DRAFT_CONF", 0.3f32),
+            fast_head: env_or("FERRITE_FAST_HEAD", 1u8) != 0,
+            head_delta: env_or("FERRITE_HEAD_DELTA", 8.0f32),
+            head_cap: env_or("FERRITE_HEAD_CAP", 256usize),
             last_logits: Vec::new(),
             logits_fresh: false,
             snapshot: None,
@@ -245,6 +255,15 @@ impl Engine {
         self.pool.set_active(if batch <= 2 { self.decode_threads } else { self.pool.max_threads() });
     }
 
+    /// LM head over `n` hidden rows from `first` (see `fast_head`).
+    fn head_logits(&mut self, first: usize, n: usize) {
+        if self.fast_head {
+            self.model.logits_shortlist(&self.pool, &mut self.sc, first, n, self.head_delta, self.head_cap);
+        } else {
+            self.model.logits(&self.pool, &mut self.sc, first, n);
+        }
+    }
+
     /// Feed tokens and return the logits after the last one.
     pub fn feed(&mut self, tokens: &[u32]) -> Result<&[f32]> {
         self.set_width(tokens.len());
@@ -255,7 +274,7 @@ impl Engine {
                 self.push_mtp_hidden(0, c.len());
             }
             if c.as_ptr_range().end == tokens.as_ptr_range().end {
-                self.model.logits(&self.pool, &mut self.sc, c.len() - 1, 1);
+                self.head_logits(c.len() - 1, 1);
             }
             if spec {
                 self.mtp_catchup(None)?;
@@ -446,7 +465,7 @@ impl Engine {
             batch.extend_from_slice(&drafts);
             self.model.forward_ckpt(&self.pool, &mut self.state, &mut self.sc, &batch, n)?;
             self.push_mtp_hidden(0, n + 1);
-            self.model.logits(&self.pool, &mut self.sc, 0, n + 1);
+            self.head_logits(0, n + 1);
             let mut accepted = 0;
             let mut corrected = None;
             let mut halt = None;
