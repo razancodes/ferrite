@@ -35,6 +35,9 @@ pub enum DType {
     Q6R,
     /// raw bytes (embedded blobs such as the tokenizer)
     U8,
+    /// 2-bit indices into `Q2CB` (2.5 bits/weight). Only for the proxy LM head,
+    /// whose job is ranking candidates that the exact head then scores.
+    Q2R,
 }
 
 pub const GROUP: usize = 16;
@@ -44,6 +47,9 @@ pub const BLOCK: usize = 32;
 /// zero where most weights live, giving lower error than uniform Q4 at the same size.
 pub const IQ4NL: [i8; 16] = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
 
+/// 2-bit codebook (symmetric, outer/inner ratio ~3 as for a Gaussian's 4-level Lloyd-Max).
+pub const Q2CB: [i8; 4] = [-127, -40, 40, 127];
+
 impl DType {
     /// Bytes of packed quants per 32-column block of a 16-row group.
     pub fn block_qbytes(self) -> usize {
@@ -51,6 +57,7 @@ impl DType {
             DType::Q8R => 512,
             DType::Q4R => 256,
             DType::Q6R => 384,
+            DType::Q2R => 128,
             _ => 0,
         }
     }
@@ -62,6 +69,7 @@ impl DType {
             DType::Q8R => nb * (512 + 32),
             DType::Q4R => nb * (256 + 32),
             DType::Q6R => nb * (384 + 32),
+            DType::Q2R => nb * (128 + 32),
             DType::U8 => GROUP * k,
         }
     }
@@ -78,6 +86,7 @@ impl DType {
             DType::Q8R => 8.5,
             DType::Q4R => 4.5,
             DType::Q6R => 6.5,
+            DType::Q2R => 2.5,
             DType::U8 => 8.0,
         }
     }
@@ -87,6 +96,7 @@ impl DType {
             "q8" | "q8r" => Some(DType::Q8R),
             "q4" | "q4r" => Some(DType::Q4R),
             "q6" | "q6r" => Some(DType::Q6R),
+            "q2" | "q2r" => Some(DType::Q2R),
             _ => None,
         }
     }
@@ -199,6 +209,7 @@ pub fn quantize_matrix(w: &[f32], rows: usize, k: usize, dt: DType, importance: 
                         DType::Q8R => pack_q8r_group(rows_w, k, gout),
                         DType::Q4R => pack_q4r_group(rows_w, k, gout, importance),
                         DType::Q6R => pack_q6r_group(rows_w, k, gout, importance),
+                        DType::Q2R => pack_q2r_group(rows_w, k, gout, importance),
                         DType::F32 | DType::U8 => unreachable!(),
                     }
                 }
@@ -225,6 +236,64 @@ fn pack_q8r_group(w: &[f32], k: usize, out: &mut [u8]) {
                 let j = c / 4;
                 let m = c % 4;
                 quants[b * 512 + j * 64 + r * 4 + m] = (q + 128) as u8;
+            }
+        }
+    }
+}
+
+/// `quantize_block_iq4` for a small arbitrary codebook (sorted ascending).
+fn quantize_block_cb(x: &[f32], wts: &[f32], cb: &[i8], idx: &mut [u8]) -> f32 {
+    let near = |v: f32| (0..cb.len()).min_by(|&a, &b| (v - cb[a] as f32).abs().total_cmp(&(v - cb[b] as f32).abs())).unwrap();
+    let vmax = x.iter().fold(0f32, |m, &v| if v.abs() > m.abs() { v } else { m });
+    if vmax.abs() < 1e-30 {
+        idx.iter_mut().for_each(|i| *i = 0);
+        return 0.0;
+    }
+    let lo = cb[0] as f32;
+    let fit = |id: f32, idx: &mut [u8]| {
+        let (mut sqx, mut sq2) = (0f32, 0f32);
+        for (j, &v) in x.iter().enumerate() {
+            idx[j] = near(id * v) as u8;
+            let q = cb[idx[j] as usize] as f32;
+            sqx += wts[j] * q * v;
+            sq2 += wts[j] * q * q;
+        }
+        (sqx, sq2)
+    };
+    let (mut best_d, mut best) = (vmax / lo, -1f32);
+    for itry in -10..=10 {
+        let (sqx, sq2) = fit((lo + 4.0 * itry as f32) / vmax, idx);
+        if sq2 > 0.0 && (best < 0.0 || sqx * sqx > best * sq2) {
+            best_d = sqx / sq2;
+            best = best_d * sqx;
+        }
+    }
+    let (sqx, sq2) = fit(if best_d != 0.0 { 1.0 / best_d } else { 0.0 }, idx);
+    if sq2 > 0.0 { sqx / sq2 } else { best_d }
+}
+
+/// 2-bit layout per 32-column block: two 64-byte chunks of [row][4 bytes];
+/// column 4*j+m sits in chunk j%2, bits 2*(j/2).. of byte (row, m).
+fn pack_q2r_group(w: &[f32], k: usize, out: &mut [u8], importance: Option<&[f32]>) {
+    let nb = k / BLOCK;
+    let (quants, scales) = out.split_at_mut(nb * 128);
+    let mut idx = [0u8; BLOCK];
+    let mut wts = [0f32; BLOCK];
+    for r in 0..GROUP {
+        let row = &w[r * k..(r + 1) * k];
+        for b in 0..nb {
+            let x = &row[b * BLOCK..(b + 1) * BLOCK];
+            block_weights(x, importance, b * BLOCK, &mut wts);
+            let d = quantize_block_cb(x, &wts, &Q2CB, &mut idx);
+            scales[(b * GROUP + r) * 2..(b * GROUP + r) * 2 + 2].copy_from_slice(&f16::from_f32(d).to_bits().to_le_bytes());
+            for v in 0..2 {
+                for m in 0..4 {
+                    let mut byte = 0u8;
+                    for f in 0..4 {
+                        byte |= idx[4 * (v + 2 * f) + m] << (2 * f);
+                    }
+                    quants[b * 128 + v * 64 + r * 4 + m] = byte;
+                }
             }
         }
     }
@@ -423,6 +492,10 @@ pub fn qvalue(dt: DType, gd: &[u8], b: usize, r: usize, c: usize) -> i32 {
             let hi = (hb >> (2 * (j % 4))) & 3;
             (lo | (hi << 4)) as i32 - 32
         }
+        DType::Q2R => {
+            let byte = gd[b * 128 + (j % 2) * 64 + r * 4 + m];
+            Q2CB[((byte >> (2 * (j / 2))) & 3) as usize] as i32
+        }
         _ => unreachable!(),
     }
 }
@@ -439,7 +512,7 @@ pub fn gather_rows(data: &[u8], dt: DType, k: usize, ids: &[u32]) -> Vec<u8> {
             }
             out
         }
-        DType::Q8R | DType::Q4R | DType::Q6R => {
+        DType::Q8R | DType::Q4R | DType::Q6R | DType::Q2R => {
             let nb = k / BLOCK;
             let gb = dt.group_bytes(k);
             // every format stores its quants as 64-byte chunks of [row][4 bytes]
@@ -479,7 +552,7 @@ pub fn dequantize_row(data: &[u8], dt: DType, k: usize, row: usize, out: &mut [f
                 out[c] = f32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
             }
         }
-        DType::Q8R | DType::Q4R | DType::Q6R => {
+        DType::Q8R | DType::Q4R | DType::Q6R | DType::Q2R => {
             let nb = k / BLOCK;
             let g = row / GROUP;
             let r = row % GROUP;

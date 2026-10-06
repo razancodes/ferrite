@@ -29,7 +29,7 @@ pub struct Recipe {
     pub rotate: bool,
     /// Also store a low-bit copy of the LM head (`lm_proxy`) that generation
     /// reads for every token, scoring only its shortlist with the exact head.
-    /// At 0.8B the 8-bit head is ~47% of the bytes per token.
+    /// At 0.8B the 8-bit head is ~47% of the bytes per token; the 2-bit proxy is 80 MB.
     pub proxy: Option<DType>,
 }
 
@@ -52,8 +52,9 @@ impl Recipe {
             "q4-fast" => (DType::Q4R, vec![q8("in_ba")], false),
             _ => bail!("unknown quantization recipe '{base}' (f32 | q8 | q6 | q4 | q4-fast)"),
         };
-        // every quantized recipe gets a 4-bit proxy head unless its head is already 4-bit
-        let mut proxy = (base != "f32" && base != "q4-fast").then_some(DType::Q4R);
+        // every quantized recipe gets a 2-bit proxy head unless its head is already 4-bit
+        // (0.8B q4: 4-bit proxy +23% decode, 2-bit +19% more; greedy output unchanged)
+        let mut proxy = (base != "f32" && base != "q4-fast").then_some(DType::Q2R);
         for p in parts {
             let (k, v) = p.split_once('=').with_context(|| format!("bad override '{p}'"))?;
             if k.trim() == "lm_proxy" {
@@ -102,6 +103,9 @@ struct Ctx<'a> {
     imatrix: Option<HashMap<String, Vec<f32>>>,
     /// imatrix statistics were collected in rotated space
     imatrix_rotated: bool,
+    /// the matching unrotated statistics (`<imatrix>.raw.json`), for matrices
+    /// left unrotated such as the 4-bit proxy head
+    imatrix_raw: Option<HashMap<String, Vec<f32>>>,
     recipe: Recipe,
     rotate: bool,
 }
@@ -161,7 +165,8 @@ impl Ctx<'_> {
                     blk.iter_mut().for_each(|x| *x = m);
                 }
             } else if rot <= 1 && self.imatrix_rotated {
-                imp = None; // rotated stats do not apply to an unrotated matrix
+                // rotated stats do not apply to an unrotated matrix; use the raw ones if any
+                imp = self.imatrix_raw.as_ref().and_then(|m| m.get(imp_key)).cloned();
             }
         }
         let q = quantize_matrix(&w, nrows, k, dt, imp.as_deref());
@@ -232,6 +237,7 @@ fn convert_mlp(cx: &mut Ctx, cfg: &Config, src: &str, dst: &str) -> Result<()> {
 
 /// `rotate`: override the recipe's default Hadamard rotation.
 pub fn convert(hf_dir: &Path, out: &Path, recipe_name: &str, imatrix: Option<&Path>, rotate: Option<bool>) -> Result<()> {
+    let imatrix_path = imatrix;
     let t0 = Instant::now();
     let recipe = Recipe::parse(recipe_name)?;
     let rotate = rotate.unwrap_or(recipe.rotate);
@@ -247,6 +253,11 @@ pub fn convert(hf_dir: &Path, out: &Path, recipe_name: &str, imatrix: Option<&Pa
             (Some(m), r)
         }
         None => (None, false),
+    };
+    let raw_path = imatrix.as_ref().and(imatrix_path.map(|p| p.with_extension("raw.json")));
+    let imatrix_raw = match raw_path.filter(|p| imatrix_rotated && p.exists()) {
+        Some(p) => Some(crate::imatrix::load(&p)?.0),
+        None => None,
     };
     let prefix = if st.contains("model.language_model.embed_tokens.weight") {
         "model.language_model"
@@ -266,7 +277,7 @@ pub fn convert(hf_dir: &Path, out: &Path, recipe_name: &str, imatrix: Option<&Pa
         cfg.vocab
     );
 
-    let mut cx = Ctx { st: &st, w: Writer::create(out)?, total_params: 0, total_bytes: 0, imatrix, imatrix_rotated, recipe: recipe.clone(), rotate };
+    let mut cx = Ctx { st: &st, w: Writer::create(out)?, total_params: 0, total_bytes: 0, imatrix, imatrix_rotated, imatrix_raw, recipe: recipe.clone(), rotate };
     let h = cfg.hidden;
 
     // Embedding / LM head

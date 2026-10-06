@@ -20,7 +20,7 @@ cat src/*.rs src/kernels/*.rs README.md scripts/*.py > scratch/code_corpus.txt
 echo "== $NAME: q8 (rotated)"
 $F convert --hf "$HF" -o "$OUT/$NAME-q8.ferrite" -q q8 2>&1 | tail -1
 echo "== $NAME: importance matrix ($CHUNKS x 512 calibration tokens)"
-$F imatrix -m "$OUT/$NAME-q8.ferrite" -f "$CALIB" -o "scratch/imatrix-$NAME.json" --chunks "$CHUNKS" 2>&1 | tail -2
+[ -f "scratch/imatrix-$NAME.json" ] || $F imatrix -m "$OUT/$NAME-q8.ferrite" -f "$CALIB" -o "scratch/imatrix-$NAME.json" --chunks "$CHUNKS" 2>&1 | tail -2
 echo "== $NAME: q6 (rotated + imatrix)"
 $F convert --hf "$HF" -o "$OUT/$NAME-q6.ferrite" -q q6 --imatrix "scratch/imatrix-$NAME.json" 2>&1 | tail -1
 echo "== $NAME: q4 (mixed + imatrix)"

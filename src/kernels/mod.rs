@@ -148,7 +148,7 @@ pub fn matmul(pool: &ThreadPool, w: &QMat, x: &[f32], t: usize, out: &mut [f32],
     match w.dtype {
         DType::F32 => matmul_f32(pool, w, x, t, out),
         DType::U8 => panic!("U8 tensor used as a matrix"),
-        DType::Q8R | DType::Q4R | DType::Q6R => {
+        DType::Q8R | DType::Q4R | DType::Q6R | DType::Q2R => {
             quantize_acts_into(pool, x, t, w.k, w.rot, qa);
             matmul_q(pool, w, qa, out);
         }
@@ -255,7 +255,7 @@ mod tests {
                 want[tt * rows + r] = dot_f32(&w[r * k..(r + 1) * k], &x[tt * k..(tt + 1) * k]);
             }
         }
-        for dt in [DType::F32, DType::Q8R, DType::Q6R, DType::Q4R] {
+        for dt in [DType::F32, DType::Q8R, DType::Q6R, DType::Q4R, DType::Q2R] {
             let data = quantize_matrix(&w, rows, k, dt, None);
             let m = QMat { dtype: dt, rows, k, ptr: data.as_ptr(), len: data.len(), id: usize::MAX, rot: 0 };
             // dequantized reference: isolates kernel bugs from quantization error

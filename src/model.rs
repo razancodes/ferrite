@@ -73,8 +73,14 @@ pub struct DraftHead {
     exact: Option<(QMat, Vec<u8>)>,
 }
 
-/// Shortlist window for the draft head (only its argmax matters).
-const DRAFT_DELTA: f32 = 4.0;
+/// Shortlist window and group cap for the draft head (only its argmax matters):
+/// a 2-bit proxy ranks less precisely than a 4-bit one, so it gets a wider window
+/// (4.0 on a 2-bit proxy lost 2 points of acceptance at 0.8B, 12.0 loses none)
+fn draft_window(proxy: DType) -> (f32, usize) {
+    let (d, c) = if proxy == DType::Q2R { (12.0, 256) } else { (4.0, 64) };
+    let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse().ok());
+    (env("FERRITE_DRAFT_DELTA").unwrap_or(d), env("FERRITE_DRAFT_CAP").unwrap_or(c as f32) as usize)
+}
 
 pub struct Model {
     pub draft: Option<DraftHead>,
@@ -458,7 +464,10 @@ impl Model {
             rmsnorm(&sc.x[(t - 1) * h..t * h], mtp.final_norm, eps, &mut sc.xn[..h]);
             let xn = std::mem::take(&mut sc.xn);
             match &draft.exact {
-                Some((ex, _)) => shortlist_matmul(pool, &draft.mat, ex, &xn[..h], 1, ex.rows, DRAFT_DELTA, 64, sc),
+                Some((ex, _)) => {
+                    let (delta, cap) = draft_window(draft.mat.dtype);
+                    shortlist_matmul(pool, &draft.mat, ex, &xn[..h], 1, ex.rows, delta, cap, sc)
+                }
                 None => {
                     resize(&mut sc.logits, draft.mat.rows);
                     matmul(pool, &draft.mat, &xn, 1, &mut sc.logits, &mut sc.qa);

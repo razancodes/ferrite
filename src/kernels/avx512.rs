@@ -12,7 +12,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 use super::{QActs, QMat};
-use crate::quant::{BLOCK, DType, GROUP, IQ4NL};
+use crate::quant::{BLOCK, DType, GROUP, IQ4NL, Q2CB};
 use std::arch::x86_64::*;
 
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni")]
@@ -55,6 +55,70 @@ static IQ4_LUT: [u8; 64] = {
     }
     t
 };
+
+/// 2-bit codebook as unsigned bytes in entries 0..4 of every 128-bit lane.
+static Q2_LUT: [u8; 64] = {
+    let mut t = [0u8; 64];
+    let mut i = 0;
+    while i < 64 {
+        t[i] = if i % 16 < 4 { (Q2CB[i % 16] as i16 + 128) as u8 } else { 0 };
+        i += 1;
+    }
+    t
+};
+
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni")]
+unsafe fn tile_q2r<const NT: usize>(
+    gq: *const u8,
+    gs: *const u8,
+    nb: usize,
+    xq: *const i8,
+    k: usize,
+    xd: *const f32,
+    xm: *const f32,
+    out: *mut f32,
+    ldo: usize,
+) {
+    unsafe {
+        let lut = _mm512_loadu_si512(Q2_LUT.as_ptr() as *const _);
+        let mask = _mm512_set1_epi8(0x03);
+        let mut acc = [_mm512_setzero_ps(); NT];
+        for b in 0..nb {
+            let dw = _mm512_cvtph_ps(_mm256_loadu_si256(gs.add(b * 32) as *const __m256i));
+            let qb = gq.add(b * 128);
+            let xb = xq.add(b * 32);
+            let mut ia = [_mm512_setzero_si512(); NT];
+            let mut ib = [_mm512_setzero_si512(); NT];
+            for v in 0..2 {
+                let raw = _mm512_loadu_si512(qb.add(v * 64) as *const _);
+                // field f of every byte holds columns 4*(v+2f)..+4
+                let fields = [raw, _mm512_srli_epi16::<2>(raw), _mm512_srli_epi16::<4>(raw), _mm512_srli_epi16::<6>(raw)];
+                for (f, fv) in fields.iter().enumerate() {
+                    let wv = _mm512_shuffle_epi8(lut, _mm512_and_si512(*fv, mask));
+                    let j = v + 2 * f;
+                    for t in 0..NT {
+                        if v == 0 {
+                            ia[t] = _mm512_dpbusd_epi32(ia[t], wv, bcast4(xb.add(t * k + j * 4)));
+                        } else {
+                            ib[t] = _mm512_dpbusd_epi32(ib[t], wv, bcast4(xb.add(t * k + j * 4)));
+                        }
+                    }
+                }
+            }
+            for t in 0..NT {
+                let s = _mm512_fmsub_ps(
+                    _mm512_cvtepi32_ps(_mm512_add_epi32(ia[t], ib[t])),
+                    _mm512_set1_ps(*xd.add(t * nb + b)),
+                    _mm512_set1_ps(*xm.add(t * nb + b)),
+                );
+                acc[t] = _mm512_fmadd_ps(s, dw, acc[t]);
+            }
+        }
+        for t in 0..NT {
+            _mm512_storeu_ps(out.add(t * ldo), acc[t]);
+        }
+    }
+}
 
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni")]
 unsafe fn tile_q8r<const NT: usize>(
@@ -229,6 +293,7 @@ fn tiles(dt: DType) -> [TileFn; 9] {
         DType::Q8R => t!(tile_q8r),
         DType::Q4R => t!(tile_q4r),
         DType::Q6R => t!(tile_q6r),
+        DType::Q2R => t!(tile_q2r),
         DType::F32 | DType::U8 => unreachable!(),
     }
 }
