@@ -41,7 +41,7 @@ SIZES = ["0.8b", "2b", "4b"]
 TEMPLATE = "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 # bit-width tiers: (label, ferrite format, llama.cpp formats, OpenVINO format)
 TIERS = [("8-bit", "q8", ["Q8_0"], "int8"), ("6-bit", "q6", ["Q6_K"], None), ("4-bit", "q4", ["Q4_K_M", "IQ4_NL"], "int4")]
-ENGINES = ["ferrite", "llama.cpp", "mistral.rs", "openvino", "onnxruntime", "transformers"]
+ENGINES = ["ferrite v2", "ferrite", "llama.cpp", "mistral.rs", "openvino", "onnxruntime", "transformers"]
 ORT_TIERS = {"4-bit": "int4"}  # ORT GenAI's builder: int4 RTN, block 32, int8 compute (accuracy level 4)
 
 
@@ -114,6 +114,9 @@ def run(cmd, timeout=3600, env=None):
 
 
 def emit(rec):
+    # FERRITE_ENGINE_LABEL (e.g. "ferrite v2") keeps runs of a newer engine build apart
+    if rec.get("engine") == "ferrite":
+        rec["engine"] = os.environ.get("FERRITE_ENGINE_LABEL", "ferrite")
     rec["time"] = time.strftime("%Y-%m-%d %H:%M:%S")
     with open(RESULTS, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec) + "\n")
@@ -351,10 +354,12 @@ def suite_chat(sizes, engines, max_tokens, cool, formats, spec_n):
 
 # ───────────────────────── quality: wikitext-2 perplexity ─────────────────────────
 
-def suite_quality(sizes, engines, windows):
+def suite_quality(sizes, engines, windows, formats=()):
     for s in sizes:
         jobs = []
         for tier, fq, lqs, _ in TIERS:
+            if formats and fq not in formats:
+                continue
             if "ferrite" in engines:
                 jobs.append(("ferrite", tier, fq, ferrite_model(s, fq)))
             if "llama.cpp" in engines:
@@ -444,16 +449,17 @@ def report():
         return c
 
     md += ["## Speed without speculation (pp512 / tg128, tok/s, median)", "",
-           "| Model | Bits | Engine · format | Size GB | Prefill | Decode (sample range) | Passes | ferrite Δ prefill | ferrite Δ decode |",
+           "| Model | Bits | Engine · format | Size GB | Prefill | Decode (sample range) | Passes | newest ferrite Δ prefill | newest ferrite Δ decode |",
            "|---|---|---|---|---|---|---|---|---|"]
     for s in SIZES:
         for tier in [t[0] for t in TIERS] + ["16/32-bit"]:
-            f = pick("speed", s, "ferrite", tier)
+            # deltas against the newest ferrite build measured for this cell
+            f = pick("speed", s, "ferrite v2", tier) or pick("speed", s, "ferrite", tier)
             f = f[0] if f else None
             for engine in ENGINES:
                 for r in pick("speed", s, engine, tier):
-                    dp = "" if engine == "ferrite" or not f else pct(f["pp"], r["pp"])
-                    dt = "" if engine == "ferrite" or not f else pct(f["tg"], r["tg"])
+                    dp = "" if not f or r is f else pct(f["pp"], r["pp"])
+                    dt = "" if not f or r is f else pct(f["tg"], r["tg"])
                     lo, hi = min(r["tg_samples"]), max(r["tg_samples"])
                     md.append(f"| {s} | {tier} | {engine} · {r['format']} | {r['file_gb']} | {r['pp']} | {r['tg']} ({lo:.1f}–{hi:.1f}) "
                               f"| {r.get('passes', 1)} | {dp} | {dt} |")
@@ -509,7 +515,7 @@ def main():
     elif a.suite == "chat":
         suite_chat(sizes, engines, a.max_tokens, a.cool, formats, a.spec_n)
     elif a.suite == "quality":
-        suite_quality(sizes, engines, a.windows)
+        suite_quality(sizes, engines, a.windows, formats)
     else:
         report()
 

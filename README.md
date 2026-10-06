@@ -194,10 +194,12 @@ HF safetensors ──convert──> .ferrite (one mmap-able file: config + token
          Engine: tokenizer → chat template → prime (prefix reuse / snapshot) → generate
             │                                          │
    forward (chunked prefill, 256 tok)          speculative step:
-   N × [RMSNorm → DeltaNet | Attention           MTP drafts ≤4 tokens → verify [tok, d1..dn]
-         → RMSNorm → SwiGLU]                     in one batch → accept prefix → replay-rollback
+   N × [RMSNorm → DeltaNet | Attention           MTP drafts ≤4 tokens (or a prompt-lookup
+         → RMSNorm → SwiGLU]                     continuation) → verify [tok, d1..dn] in one
+            │                                    batch → accept prefix → replay-rollback
+   LM head: 2-bit proxy scores the vocabulary, the 8-bit head scores the shortlist
             │
-   kernels: AVX-512 VNNI int8 GEMM/GEMV (q8/q6/q4), Hadamard rotation, vectorized exp/SiLU,
+   kernels: AVX-512 VNNI int8 GEMM/GEMV (q8/q6/q4/q2), Hadamard rotation, vectorized exp/SiLU,
             delta rule, conv4, tiled flash attention, flash-decoding, adaptive-width thread pool
 ```
 
@@ -212,9 +214,23 @@ activation broadcast straight from memory. There are no horizontal reductions in
 | `Q8R` | 8.5 | int8 + f16 scale per 32 | none |
 | `Q6R` | 6.5 | 4-bit low plane + 2-bit high plane | shifts + one `vpternlogd`; the +32 offset folds into the block correction |
 | `Q4R` | 4.5 | 4-bit index into the non-linear IQ4_NL codebook | `vpshufb` table lookup |
+| `Q2R` | 2.5 | 2-bit index into a 4-level codebook (proxy LM head only) | shift + mask, `vpshufb` |
 
 Scales come from an importance-weighted search with least-squares refits. The importance can come
-from an **imatrix**: activation statistics collected on calibration text.
+from an **imatrix**: activation statistics collected on calibration text. 4-bit files use **GPTQ**
+(`convert --gptq <q8 file>`): columns are rounded in order and each column's error is pushed
+onto the columns not yet rounded through the Cholesky factor of H⁻¹, with H = XᵀX of that
+matrix's calibration inputs (collected through the q8 model, a few layers at a time). At 0.8B it
+halves the 4-bit KL against q8 (0.044 → 0.023) at the same size.
+
+**Proxy LM head.** The vocabulary is 248K tokens, so the LM head is huge: at 0.8B the 8-bit head
+was 47% of the bytes read per token. Every file therefore also stores a 2-bit copy of it
+(`lm_proxy`, 80 MB at 0.8B). Generation scores the whole vocabulary with the proxy, then
+re-scores only the 16-row groups within 8 logits of each row's best with the exact 8-bit head
+(at most 256 groups). Shortlisted tokens get exact logits. Greedy output is byte-identical to the
+full head (checked on 8 prompts, ~2,000 tokens); chat sampling (T=0.7, top-p 0.8) matches the
+exact distribution to rounding, thinking sampling (T=1, top-p 0.95) to a mean total-variation
+distance of 1.6·10⁻⁴. Perplexity, KL and logit dumps always use the exact head.
 
 **Recipes**, chosen from measurements on Qwen3.5-0.8B against f32:
 
@@ -223,9 +239,11 @@ from an **imatrix**: activation statistics collected on calibration text.
   for q8 and 30% for q6. It *hurts* q4: there, imatrix-weighted rounding of a few salient input
   channels matters more, and rotation spreads their energy. So `q8`/`q6` rotate and `q4` does not.
 * Per-tensor sensitivity sweep at 4-bit: the DeltaNet `out_proj` and attention `o_proj` are tiny
-  but the most damaging per byte, so `q4` keeps them at 8-bit. The tied LM head is the cheapest
-  trade, which `q4-fast` takes.
-* Overrides: `-q "q4,down=q8,mtp=q4,lm_head=q6"` (classes, `class@layer`, `mtp`, `mtp.<class>`).
+  but the most damaging per byte, so `q4` keeps them at 8-bit. `q4-fast` makes them 4-bit too
+  (4% smaller, ~6% faster at 0.8B); with GPTQ its KL against q8 (0.029) is still lower than the
+  old non-GPTQ q4's (0.044).
+* Overrides: `-q "q4,down=q8,mtp=q4,lm_head=q6"` (classes, `class@layer`, `mtp`, `mtp.<class>`),
+  and `lm_proxy=q4|q2|none` for the proxy head.
 
 The converter also pre-bakes everything it can: `(1 + w)` norm offsets folded, `-exp(A_log)`
 precomputed, q/k/v/z, q/gate/k/v and gate/up projections fused, conv weights transposed, tokenizer
@@ -240,7 +258,13 @@ Each decode step:
    ones feed the MTP head its own output. The chain stops once the head's top probability drops
    below 0.3. Drafting uses a 32K-row draft LM head of the most frequent tokens (`draft-vocab`
    ranks tokens on a corpus and stores the list inside the `.ferrite` file), so each draft costs
-   about 1/8 of an LM-head pass.
+   about 1/8 of an LM-head pass. Like the main head it is scanned with its 2-bit proxy rows and
+   only the shortlist is scored with 8-bit rows: drafting from low-bit rows alone costs 4 points
+   of acceptance, the shortlist none.
+   **Prompt lookup** can replace the rest of the chain: when the last 3 tokens occurred earlier in
+   the conversation and the MTP head's first draft agrees with what followed them, up to 8 tokens
+   of that continuation are drafted for free. It is used only while lookup-drafted steps deliver
+   at least the tokens/s of MTP-drafted ones (+27% on a code edit, neutral on chat).
 2. **Verify.** The main model runs `[next, d1..dn]` as one batch; decode is memory-bound, so this
    costs about one token.
 3. **Accept left to right.** Each draft is accepted with probability p(d) under the fully processed
@@ -285,7 +309,7 @@ partially matched stop sequence is never streamed.
 
 | Command | Purpose |
 |---|---|
-| `convert` | HF checkpoint → `.ferrite` (`-q f32\|q8\|q6\|q4\|q4-fast` + overrides, `--imatrix`, `--rotate/--no-rotate`) |
+| `convert` | HF checkpoint → `.ferrite` (`-q f32\|q8\|q6\|q4\|q4-fast` + overrides, `--imatrix`, `--gptq <q8 file>`, `--rotate/--no-rotate`) |
 | `run` / `chat` / `serve` | generation (MTP speculation on by default; `--no-spec` to disable) |
 | `bench` | prefill + decode throughput (decode measured on real text so speculation is realistic) |
 | `kld` | KL divergence, top-1 agreement and perplexity of a model vs a reference model |
@@ -295,7 +319,10 @@ partially matched stop sequence is never streamed.
 | `tokenize`, `template`, `dump-logits` | debugging and parity tests |
 
 Environment variables: `FERRITE_PROFILE=1` (per-op timing table), `FERRITE_DECODE_THREADS`,
-`FERRITE_DRAFT_K`, `FERRITE_DRAFT_CONF`, `FERRITE_DRAFT_Q`, `FERRITE_LOAD=heap`,
+`FERRITE_DRAFT_K`, `FERRITE_DRAFT_CONF`, `FERRITE_DRAFT_Q`, `FERRITE_DRAFT_FROM=head` (draft from
+the exact head only), `FERRITE_DRAFT_DELTA` / `FERRITE_DRAFT_CAP`, `FERRITE_FAST_HEAD=0` (exact
+LM head in generation), `FERRITE_HEAD_DELTA` (8) / `FERRITE_HEAD_CAP` (256), `FERRITE_LOOKUP_K`
+(8, 0 = no prompt lookup), `FERRITE_LOAD=heap`, `FERRITE_GPTQ_MB` (3072),
 `FERRITE_FORCE_SCALAR=1` (disable AVX-512 kernels), `FERRITE_NO_TILED_ATTN=1`.
 
 ## Validation
@@ -325,10 +352,19 @@ cargo run --release --example bw_bench       # memory bandwidth ceiling
   page cache arrives through random page faults: the first run of 2B q8 took 47 minutes.
   `FERRITE_LOAD=heap` reads the file sequentially instead (about a minute). Once cached, both
   modes decode at the same speed.
+* Memory is 4 GB soldered + a 16 GB SODIMM (flex mode: 8 GB dual-channel, 12 GB single-channel,
+  both at 2667 because of the soldered part). Where the OS puts the weights decides decode speed:
+  the same binary and model ran at 42.6–50.4 tok/s across eight launches (24.6–29.1 GB/s).
+  `examples/placement_probe.rs` shows 64 MB chunks are mixtures (16–27 GB/s), so picking chunks
+  gains little. Page-level control needs AWE physical pages: grant the account "Lock pages in
+  memory" (SeLockMemoryPrivilege), sign out and in, then `cargo run --release --example
+  awe_probe` measures bandwidth by physical address range.
 
 ## Roadmap
 
 * Qwen3.8-27B: the architecture is supported, but at q4 it needs ~15 GB of RAM and would run at
   ~1–2 tok/s here.
-* GPTQ-style error-compensated 4-bit quantization (needs per-layer activation covariances).
+* Weight placement in the dual-channel region via AWE physical pages, once the privilege is set
+  (see *Notes for this machine*).
+* Branching (tree) drafts: verify a second candidate for the first draft position as well.
 * AVX2 fallback kernels for CPUs without AVX-512 (a portable scalar path exists today).
