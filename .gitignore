@@ -7,3 +7,6 @@ __pycache__/
 
 # Tauri build output
 app/gen/
+/bench/engines/
+/bench/runs/*
+!/bench/runs/results.jsonl

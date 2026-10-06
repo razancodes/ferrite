@@ -242,7 +242,7 @@ fn handle_completion(state: &ServerState, stream: &mut TcpStream, body: &Value, 
         "total_tokens": st.prompt_tokens + st.gen_tokens});
     let timings = json!({"prompt_n": st.prompt_tokens - st.cached_tokens, "cached_n": st.cached_tokens,
         "prompt_per_second": st.prefill_tps(), "predicted_n": st.gen_tokens, "predicted_per_second": st.gen_tps(),
-        "time_to_first_token_ms": ttft.unwrap_or(0.0) * 1e3});
+        "time_to_first_token_ms": ttft.unwrap_or(0.0) * 1e3, "draft_n": st.drafted, "draft_n_accepted": st.accepted});
     eprintln!(
         "[server] prompt {} ({} cached) {:.1} tok/s | gen {} {:.2} tok/s | {}",
         st.prompt_tokens,

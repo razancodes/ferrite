@@ -192,6 +192,9 @@ enum Cmd {
         /// process tokens one at a time instead of as a batch
         #[arg(long)]
         step: bool,
+        /// process tokens in batches of this size (tests prefill continuing an existing state)
+        #[arg(long, default_value_t = 0)]
+        chunk: usize,
     },
     /// Collect an importance matrix (activation statistics) on calibration text
     Imatrix {
@@ -280,7 +283,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::DumpLogits { m, tokens, out, step } => cmd_dump(m, tokens, out, step),
+        Cmd::DumpLogits { m, tokens, out, step, chunk } => cmd_dump(m, tokens, out, if step { 1 } else { chunk }),
         Cmd::Template { m, file, think } => {
             let model = ferrite::model::Model::load(&m.model)?;
             let msgs: Vec<Message> = serde_json::from_str(&std::fs::read_to_string(&file)?)?;
@@ -528,14 +531,20 @@ fn cmd_bench(m: ModelArgs, pp: usize, tg: usize, reps: usize) -> Result<()> {
     Ok(())
 }
 
-fn cmd_dump(m: ModelArgs, tokens: String, out: PathBuf, step: bool) -> Result<()> {
+fn cmd_dump(m: ModelArgs, tokens: String, out: PathBuf, chunk: usize) -> Result<()> {
     let mut e = load_engine(&m)?;
     let ids: Vec<u32> = tokens.split(',').map(|s| s.trim().parse::<u32>().context("token id")).collect::<Result<_>>()?;
     let v = e.model.vocab_rows();
     let mut all = Vec::with_capacity(ids.len() * v);
-    if step {
+    if chunk == 1 {
         for &id in &ids {
             all.extend_from_slice(e.feed(&[id])?);
+        }
+    } else if chunk > 1 {
+        for c in ids.chunks(chunk) {
+            e.model.forward(&e.pool, &mut e.state, &mut e.sc, c)?;
+            e.model.logits(&e.pool, &mut e.sc, 0, c.len());
+            all.extend_from_slice(&e.sc.logits[..c.len() * v]);
         }
     } else {
         e.model.forward(&e.pool, &mut e.state, &mut e.sc, &ids)?;
@@ -574,7 +583,12 @@ fn cmd_ppl(m: ModelArgs, file: PathBuf, window: usize, windows: usize) -> Result
             e.model.logits(&e.pool, &mut e.sc, 0, chunk.len());
             for i in 0..chunk.len() {
                 let gi = half + ci * 64 + i; // index within seg of this position
-                let target = if gi + 1 < seg.len() { seg[gi + 1] } else { ids[start + window] };
+                // targets stay inside the window, as in llama.cpp's llama-perplexity, so the
+                // two report perplexity over exactly the same tokens
+                if gi + 1 >= seg.len() {
+                    continue;
+                }
+                let target = seg[gi + 1];
                 let row = &e.sc.logits[i * v..(i + 1) * v];
                 let mx = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
                 let lse = row.iter().map(|&x| ((x - mx) as f64).exp()).sum::<f64>().ln() + mx as f64;

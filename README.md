@@ -58,11 +58,46 @@ Where the time goes:
 
 * f32 engine vs HF float32 logits: max |Δ| 0.007, KL ≈ 0, 100% top-1, in batched prefill, tiled
   attention and step-by-step decode. 4B (2:1 DeltaNet heads) q8 vs HF bf16: KL 0.0009, 100% top-1.
+* On a full 512-token wikitext window, KL ≈ 0 at every position in one batch, in 64- and 256-token
+  chunks continuing an existing state (`dump-logits --chunk`), and token by token. Wikitext-2
+  perplexity over 32 windows: 15.3475, against 15.3468 from HF transformers.
 * Tokenizer: byte-identical ids on 2.8M wikitext tokens plus a Unicode torture test.
 * Chat template: identical to the model's Jinja template for single/multi-turn, system, reasoning
   history and tool messages, thinking on/off.
 * Speculative decoding is lossless: greedy output is byte-identical with and without it (checked
   for draft chains of 1–4 tokens); with sampling the output distribution is provably unchanged.
+
+## Compared with other engines
+
+`bench/` runs ferrite head to head against llama.cpp (b11425), mistral.rs (0.9.4), OpenVINO GenAI
+(2026.4.1) and HF transformers on the same Qwen3.5 checkpoints on this laptop. Full tables and
+method notes: [`bench/RESULTS.md`](bench/RESULTS.md).
+
+| 2B, 6-bit | ferrite q6 | llama.cpp Q6_K | mistral.rs Q6_K | OpenVINO |
+|---|---|---|---|---|
+| Prefill, pp512 (tok/s) | **184** | 130 | 86 | 45 (int4) |
+| Decode, no speculation (tok/s) | **12.9** | 12.5 | 9.5 | 12.4 (int4) |
+| Chat decode with MTP speculation (tok/s) | **28.0** | 13.4 (best of 1–4 drafts) | — | 9.5 (int4) |
+| Peak RAM in chat | **1.8 GB** | 2.3 GB | — | 4.1 GB (int4) |
+| Wikitext-2 perplexity | 10.47 | 10.48 | — | — |
+
+* **Prefill** is 1.4–3.4× llama.cpp, 2.1–2.8× mistral.rs and 4–9× OpenVINO, at every size and
+  bit width.
+* **Decode without speculation** is memory-bound, so engines converge: within ±5% of llama.cpp at
+  2B/4B, 10–14% ahead at 0.8B 6/4-bit, 17% behind at 0.8B 8-bit. Smaller files win, so
+  llama.cpp's IQ4_NL (11% smaller than our q4) decodes 12% faster at 2B.
+* **Speculation** is the big gap: ferrite's MTP gives 1.5–1.95× in chat; llama.cpp's MTP gives
+  0.76–1.22× (with its default of 3 drafts it is slower than no speculation at 0.8B and at 2B
+  6/4-bit; 1 draft is its best at 2B 6-bit), OpenVINO's 0.75–1.23×. ferrite's speculative output
+  is identical to plain greedy decoding in every run; llama.cpp's and OpenVINO's diverge in some
+  replies.
+* **Quality** at equal size matches or slightly beats llama.cpp at 8 and 6 bits (0.05–1.3% lower
+  perplexity). At 4 bits, ours beats IQ4_NL at every size but trails Q4_K_M by about 1% at 2B/4B
+  while being 6–8% larger.
+* **Memory**: llama.cpp peaks at 1.2–1.8× and OpenVINO at 2.2–2.6× ferrite's RAM in chat.
+
+Reproduce: `bench/prepare.sh` (llama.cpp files), the OpenVINO downloads listed there, then
+`bench/run_all.sh` (several hours here).
 
 ## Quick start
 
@@ -282,6 +317,10 @@ cargo run --release --example bw_bench       # memory bandwidth ceiling
   is looked up on PATH only, so builds put WinLibs `bin` first (`chat.cmd` does this).
 * Windows cannot overwrite a file that a running process has memory-mapped. Don't convert onto a
   `.ferrite` file that a running `ferrite` is using.
+* The drive is a 5400 rpm hard disk. With the default mmap loading, a model that isn't in the
+  page cache arrives through random page faults: the first run of 2B q8 took 47 minutes.
+  `FERRITE_LOAD=heap` reads the file sequentially instead (about a minute). Once cached, both
+  modes decode at the same speed.
 
 ## Roadmap
 
