@@ -135,7 +135,7 @@ impl Gptq {
                 .filter(|(_, t)| t.shape.len() == 2 && layer(&t.name) == Some(li) && t.name.starts_with('L'))
                 .map(|(id, t)| (id, t.shape[1]))
                 .collect();
-            let b: usize = mats.iter().map(|(_, k)| 2 * k * k * 4).sum(); // H + scratch
+            let b: usize = mats.iter().map(|(_, k)| k * k * 4).sum();
             if li > first && bytes + b > self.budget {
                 break;
             }

@@ -9,8 +9,8 @@
 //! with each registered matrix's input, `take` returns the averaged H.
 //! `STOP_AFTER` lets a calibration pass stop after the last layer needed.
 
-use crate::kernels::{QActs, QMat};
-use crate::quant::{BLOCK, DType, IQ4NL};
+use crate::kernels::QMat;
+use crate::quant::{BLOCK, IQ4NL};
 use crate::threadpool::ThreadPool;
 use faer::{Accum, Mat, Par, Side};
 use std::collections::HashMap;
@@ -23,14 +23,13 @@ pub static STOP_AFTER: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 struct Acc {
     h: Vec<f32>,
-    scratch: Vec<f32>,
     rows: u64,
 }
 static STATS: Mutex<Option<HashMap<usize, Acc>>> = Mutex::new(None);
 
 /// Start collecting H for these tensor ids (with their input sizes `k`).
 pub fn begin(ids: &[(usize, usize)]) {
-    let map = ids.iter().map(|&(id, k)| (id, Acc { h: vec![0f32; k * k], scratch: Vec::new(), rows: 0 })).collect();
+    let map = ids.iter().map(|&(id, k)| (id, Acc { h: vec![0f32; k * k], rows: 0 })).collect();
     *STATS.lock().unwrap() = Some(map);
     ON.store(true, Ordering::SeqCst);
 }
@@ -48,24 +47,17 @@ pub fn take() -> HashMap<usize, Vec<f32>> {
         .collect()
 }
 
-/// H += x^T x for a registered matrix (x: [t, w.k]), via the f32 GEMM:
-/// with X^T as both operands, out[i, c] = sum over tokens of x[., c] * x[., i].
-pub fn observe(pool: &ThreadPool, w: &QMat, x: &[f32], t: usize) {
+/// H += x^T x for a registered matrix (x: [t, w.k], row-major), with faer's
+/// cache-blocked GEMM straight into the accumulator. (The engine's f32 GEMM is
+/// built for few tokens: at k = 9216 every output row re-streamed the whole
+/// 9 MB activation block, ~4 hours per 4B model instead of minutes.)
+pub fn observe(_pool: &ThreadPool, w: &QMat, x: &[f32], t: usize) {
     let mut g = STATS.lock().unwrap();
     let Some(acc) = g.as_mut().and_then(|m| m.get_mut(&w.id)) else { return };
     let k = w.k;
-    let mut xt = vec![0f32; k * t];
-    for tok in 0..t {
-        for c in 0..k {
-            xt[c * t + tok] = x[tok * k + c];
-        }
-    }
-    let m = QMat { dtype: DType::F32, rows: k, k: t, ptr: xt.as_ptr() as *const u8, len: xt.len() * 4, id: usize::MAX, rot: 0 };
-    acc.scratch.resize(k * k, 0.0);
-    crate::kernels::matmul(pool, &m, &xt, k, &mut acc.scratch, &mut QActs::default());
-    for (h, s) in acc.h.iter_mut().zip(&acc.scratch) {
-        *h += *s;
-    }
+    let xm = faer::MatRef::from_row_major_slice(&x[..t * k], t, k);
+    let hm = faer::MatMut::from_row_major_slice_mut(&mut acc.h, k, k);
+    faer::linalg::matmul::matmul(hm, Accum::Add, xm.transpose(), xm, 1.0f32, Par::rayon(0));
     acc.rows += t as u64;
 }
 
@@ -155,6 +147,7 @@ pub fn quantize_q4r(w: &[f32], rows: usize, k: usize, h: &[f32]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quant::DType;
 
     #[test]
     fn gptq_beats_plain_rounding_on_correlated_inputs() {
