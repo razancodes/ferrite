@@ -300,7 +300,7 @@ fn pack_q2r_group(w: &[f32], k: usize, out: &mut [u8], importance: Option<&[f32]
 }
 
 #[inline]
-fn nearest_iq4(x: f32) -> usize {
+pub(crate) fn nearest_iq4(x: f32) -> usize {
     // binary search in the sorted codebook
     if x <= IQ4NL[0] as f32 {
         return 0;
@@ -360,6 +360,31 @@ pub fn quantize_block_iq4(x: &[f32], wts: &[f32], idx: &mut [u8]) -> f32 {
         sq2 += wts[j] * q * q;
     }
     if sq2 > 0.0 { sqx / sq2 } else { best_d }
+}
+
+/// Pack precomputed codebook indices [rows, k] and block scales [rows, k/32]
+/// (from `gptq`) into the Q4R layout.
+pub(crate) fn pack_q4r_indices(idx: &[u8], scales: &[f32], rows: usize, k: usize) -> Vec<u8> {
+    let nb = k / BLOCK;
+    let gb = DType::Q4R.group_bytes(k);
+    let mut out = vec![0u8; rows / GROUP * gb];
+    for (g, gout) in out.chunks_mut(gb).enumerate() {
+        let (quants, sc) = gout.split_at_mut(nb * 256);
+        for r in 0..GROUP {
+            let row = g * GROUP + r;
+            for b in 0..nb {
+                let d = f16::from_f32(scales[row * nb + b]);
+                sc[(b * GROUP + r) * 2..(b * GROUP + r) * 2 + 2].copy_from_slice(&d.to_bits().to_le_bytes());
+                let id = &idx[row * k + b * BLOCK..row * k + (b + 1) * BLOCK];
+                for p in 0..4 {
+                    for m in 0..4 {
+                        quants[b * 256 + p * 64 + r * 4 + m] = id[4 * p + m] | (id[4 * (p + 4) + m] << 4);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 fn pack_q4r_group(w: &[f32], k: usize, out: &mut [u8], importance: Option<&[f32]>) {

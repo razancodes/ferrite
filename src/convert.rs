@@ -95,6 +95,71 @@ impl Recipe {
     }
 }
 
+/// Calibration source for GPTQ: an already converted (8-bit) model of the same
+/// checkpoint and calibration tokens. Input covariances are collected a few
+/// layers at a time (as many as fit in `budget` bytes) when first needed.
+pub struct Gptq {
+    e: crate::engine::Engine,
+    calib: Vec<u32>,
+    chunks: usize,
+    budget: usize,
+    cache: HashMap<String, Vec<f32>>,
+}
+
+impl Gptq {
+    pub fn new(model: &Path, calib: &Path, chunks: usize) -> Result<Gptq> {
+        let mut e = crate::engine::Engine::load(model, crate::engine::default_threads(), 1024)?;
+        e.fast_head = false;
+        let ids = e.model.tokenizer.encode(&std::fs::read_to_string(calib).with_context(|| format!("read {}", calib.display()))?, false);
+        let chunks = chunks.min(ids.len() / 512);
+        let budget = std::env::var("FERRITE_GPTQ_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(3072usize) << 20;
+        Ok(Gptq { e, calib: ids, chunks, budget, cache: HashMap::new() })
+    }
+
+    /// Input covariance of the per-layer matrix `name` (e.g. "L3.down"), or None.
+    fn hessian(&mut self, name: &str) -> Result<Option<Vec<f32>>> {
+        if let Some(h) = self.cache.remove(name) {
+            return Ok(Some(h));
+        }
+        let layer = |n: &str| n.strip_prefix('L').and_then(|s| s.split('.').next()).and_then(|s| s.parse::<usize>().ok());
+        let Some(first) = layer(name) else { return Ok(None) };
+        let hdr = &self.e.model.file.header;
+        let mut want = Vec::new();
+        let (mut bytes, mut last) = (0usize, first);
+        for li in first..hdr.config.n_layers {
+            let mats: Vec<(usize, usize)> = hdr
+                .tensors
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.shape.len() == 2 && layer(&t.name) == Some(li) && t.name.starts_with('L'))
+                .map(|(id, t)| (id, t.shape[1]))
+                .collect();
+            let b: usize = mats.iter().map(|(_, k)| 2 * k * k * 4).sum(); // H + scratch
+            if li > first && bytes + b > self.budget {
+                break;
+            }
+            want.extend(mats);
+            bytes += b;
+            last = li;
+        }
+        let t0 = Instant::now();
+        crate::gptq::begin(&want);
+        crate::gptq::STOP_AFTER.store(last, std::sync::atomic::Ordering::SeqCst);
+        let run = (0..self.chunks).try_for_each(|c| {
+            self.e.reset();
+            self.e.feed(&self.calib[c * 512..(c + 1) * 512]).map(|_| ())
+        });
+        crate::gptq::STOP_AFTER.store(usize::MAX, std::sync::atomic::Ordering::SeqCst);
+        let hs = crate::gptq::take();
+        run?;
+        for (id, h) in hs {
+            self.cache.insert(self.e.model.file.header.tensors[id].name.clone(), h);
+        }
+        eprint!("\r  gptq: input covariances of layers {first}-{last} ({:.0}s)            \n", t0.elapsed().as_secs_f64());
+        Ok(self.cache.remove(name))
+    }
+}
+
 struct Ctx<'a> {
     st: &'a SafeTensors,
     w: Writer,
@@ -108,6 +173,7 @@ struct Ctx<'a> {
     imatrix_raw: Option<HashMap<String, Vec<f32>>>,
     recipe: Recipe,
     rotate: bool,
+    gptq: Option<Gptq>,
 }
 
 impl Ctx<'_> {
@@ -169,7 +235,15 @@ impl Ctx<'_> {
                 imp = self.imatrix_raw.as_ref().and_then(|m| m.get(imp_key)).cloned();
             }
         }
-        let q = quantize_matrix(&w, nrows, k, dt, imp.as_deref());
+        // GPTQ for unrotated 4-bit matrices when a calibration model is given
+        let h = match self.gptq.as_mut() {
+            Some(g) if dt == DType::Q4R && rot <= 1 => g.hessian(out_name)?,
+            _ => None,
+        };
+        let q = match h {
+            Some(h) => crate::gptq::quantize_q4r(&w, nrows, k, &h),
+            None => quantize_matrix(&w, nrows, k, dt, imp.as_deref()),
+        };
         if out_name != "lm_proxy" {
             self.total_params += nrows * k; // the proxy duplicates the head's parameters
         }
@@ -236,7 +310,7 @@ fn convert_mlp(cx: &mut Ctx, cfg: &Config, src: &str, dst: &str) -> Result<()> {
 }
 
 /// `rotate`: override the recipe's default Hadamard rotation.
-pub fn convert(hf_dir: &Path, out: &Path, recipe_name: &str, imatrix: Option<&Path>, rotate: Option<bool>) -> Result<()> {
+pub fn convert(hf_dir: &Path, out: &Path, recipe_name: &str, imatrix: Option<&Path>, rotate: Option<bool>, gptq: Option<Gptq>) -> Result<()> {
     let imatrix_path = imatrix;
     let t0 = Instant::now();
     let recipe = Recipe::parse(recipe_name)?;
@@ -277,7 +351,7 @@ pub fn convert(hf_dir: &Path, out: &Path, recipe_name: &str, imatrix: Option<&Pa
         cfg.vocab
     );
 
-    let mut cx = Ctx { st: &st, w: Writer::create(out)?, total_params: 0, total_bytes: 0, imatrix, imatrix_rotated, imatrix_raw, recipe: recipe.clone(), rotate };
+    let mut cx = Ctx { st: &st, w: Writer::create(out)?, total_params: 0, total_bytes: 0, imatrix, imatrix_rotated, imatrix_raw, recipe: recipe.clone(), rotate, gptq };
     let h = cfg.hidden;
 
     // Embedding / LM head
@@ -362,6 +436,7 @@ pub fn convert(hf_dir: &Path, out: &Path, recipe_name: &str, imatrix: Option<&Pa
     meta.insert("source".into(), serde_json::json!(hf_dir.file_name().map(|s| s.to_string_lossy().to_string())));
     meta.insert("recipe".into(), serde_json::json!(recipe_name));
     meta.insert("rotated".into(), serde_json::json!(rotate));
+    meta.insert("gptq".into(), serde_json::json!(cx.gptq.is_some()));
     meta.insert("has_mtp".into(), serde_json::json!(has_mtp));
     meta.insert("vocab_rows".into(), serde_json::json!(vocab_rows));
     meta.insert("params".into(), serde_json::json!(cx.total_params));

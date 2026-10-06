@@ -101,6 +101,16 @@ enum Cmd {
         /// force Hadamard rotation off
         #[arg(long)]
         no_rotate: bool,
+        /// GPTQ for the 4-bit matrices, calibrated through this already converted
+        /// (8-bit) model of the same checkpoint
+        #[arg(long)]
+        gptq: Option<PathBuf>,
+        /// calibration text for --gptq
+        #[arg(long, default_value = "data/wiki.train.raw")]
+        calib: PathBuf,
+        /// 512-token calibration chunks for --gptq
+        #[arg(long, default_value_t = 48)]
+        chunks: usize,
     },
     /// Generate a completion for one prompt
     Run {
@@ -251,9 +261,10 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Convert { hf, out, quant, imatrix, rotate, no_rotate } => {
+        Cmd::Convert { hf, out, quant, imatrix, rotate, no_rotate, gptq, calib, chunks } => {
             let rot = if rotate { Some(true) } else if no_rotate { Some(false) } else { None };
-            ferrite::convert::convert(&hf, &out, &quant, imatrix.as_deref(), rot)
+            let g = gptq.map(|m| ferrite::convert::Gptq::new(&m, &calib, chunks)).transpose()?;
+            ferrite::convert::convert(&hf, &out, &quant, imatrix.as_deref(), rot, g)
         }
         Cmd::Run { m, s, prompt, max_tokens, raw, think, system } => cmd_run(m, s, prompt, max_tokens, raw, think, system),
         Cmd::Chat { m, s, think, system, max_tokens } => cmd_chat(m, s, think, system, max_tokens),

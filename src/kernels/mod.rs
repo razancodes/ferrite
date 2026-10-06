@@ -145,6 +145,9 @@ pub fn matmul(pool: &ThreadPool, w: &QMat, x: &[f32], t: usize, out: &mut [f32],
     if IMATRIX_ON.load(std::sync::atomic::Ordering::Relaxed) && w.id != usize::MAX {
         collect_imatrix(w, x, t);
     }
+    if crate::gptq::ON.load(std::sync::atomic::Ordering::Relaxed) && w.id != usize::MAX {
+        crate::gptq::observe(pool, w, x, t);
+    }
     match w.dtype {
         DType::F32 => matmul_f32(pool, w, x, t, out),
         DType::U8 => panic!("U8 tensor used as a matrix"),

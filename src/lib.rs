@@ -11,6 +11,7 @@ pub mod config;
 pub mod convert;
 pub mod engine;
 pub mod format;
+pub mod gptq;
 pub mod imatrix;
 pub mod kernels;
 pub mod model;

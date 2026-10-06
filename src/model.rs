@@ -513,7 +513,8 @@ impl Model {
                 self.embed_row(tok, &mut sc.x[i * h..(i + 1) * h]);
             }
         }
-        for (li, layer) in self.layers.iter().enumerate() {
+        let stop = crate::gptq::STOP_AFTER.load(std::sync::atomic::Ordering::Relaxed);
+        for (li, layer) in self.layers.iter().enumerate().take(stop.saturating_add(1)) {
             self.layer_forward(pool, layer, li, st, sc, t, st.pos, ckpt)?;
         }
         st.pos += t;
