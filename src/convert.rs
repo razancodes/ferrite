@@ -48,13 +48,14 @@ impl Recipe {
             // projections and the attention/DeltaNet output projections (small
             // but the most quantization-sensitive per byte) stay 8-bit
             "q4" => (DType::Q4R, vec![q8("lm_head"), q8("embed"), q8("in_ba"), q8("out_proj"), q8("o_proj")], false),
-            // everything 4-bit except the gate projections: smallest/fastest, lossy
-            "q4-fast" => (DType::Q4R, vec![q8("in_ba")], false),
+            // the output projections 4-bit too: ~4% smaller and ~6% faster than q4 at 0.8B;
+            // with GPTQ still better than q4 without it (KL vs q8 0.029, q4: 0.044 -> 0.023)
+            "q4-fast" => (DType::Q4R, vec![q8("lm_head"), q8("embed"), q8("in_ba")], false),
             _ => bail!("unknown quantization recipe '{base}' (f32 | q8 | q6 | q4 | q4-fast)"),
         };
-        // every quantized recipe gets a 2-bit proxy head unless its head is already 4-bit
+        // every quantized recipe gets a 2-bit proxy head
         // (0.8B q4: 4-bit proxy +23% decode, 2-bit +19% more; greedy output unchanged)
-        let mut proxy = (base != "f32" && base != "q4-fast").then_some(DType::Q2R);
+        let mut proxy = (base != "f32").then_some(DType::Q2R);
         for p in parts {
             let (k, v) = p.split_once('=').with_context(|| format!("bad override '{p}'"))?;
             if k.trim() == "lm_proxy" {

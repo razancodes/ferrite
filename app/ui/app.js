@@ -78,9 +78,12 @@
     toast.h = setTimeout(() => t.classList.remove("show"), ms);
   }
   function prettyName(name) {
-    // qwen3.5-2b-q6 -> "Qwen3.5 <em>2B</em>"
+    // qwen3.5-2b-q6 -> "Qwen3.5 <em>2B</em>" (also qwen3.5-0.8b-q4-fast)
     const parts = name.split("-");
-    const quant = /^q\d/i.test(parts[parts.length - 1]) ? parts.pop() : "";
+    const n = parts.length;
+    const quant = n > 2 && parts[n - 1] === "fast" && /^q\d/i.test(parts[n - 2])
+      ? parts.splice(-2).join("-")
+      : /^q\d/i.test(parts[n - 1]) ? parts.pop() : "";
     const size = parts.length > 1 && /^\d/.test(parts[parts.length - 1]) ? parts.pop() : "";
     const base = parts.join("-").replace(/^qwen/i, "Qwen");
     return { html: `${esc(base)}${size ? ` <em>${esc(size.toUpperCase())}</em>` : ""}`, quant: quant.toUpperCase(), plain: `${base} ${size.toUpperCase()}`.trim() };
