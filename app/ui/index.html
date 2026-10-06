@@ -27,13 +27,20 @@
 <div class="frame">
   <aside class="side" aria-label="Model and settings">
     <div class="sh"><span class="i">01</span><span class="l">Model</span><span class="r"></span><span class="x" id="model-count"></span></div>
-    <div class="ledger" id="models"></div>
+    <details class="msel" id="msel">
+      <summary class="mrow sel" id="mcur" title="Switch model"></summary>
+      <div class="mlist" id="models"></div>
+    </details>
     <div class="side-actions">
       <button class="btn-rule" id="browse">Browse <span class="arrow">↗</span></button>
       <button class="btn-rule" id="rescan">Rescan</button>
     </div>
 
     <div class="sh"><span class="i">02</span><span class="l">Sampling</span><span class="r"></span><button class="x" id="defaults" title="Qwen's recommended settings">Reset</button></div>
+    <div class="presets" role="group" aria-label="Presets">
+      <button type="button" class="preset" id="p-think" title="Thinking on, Qwen's thinking sampler, 32K context and up to 32K new tokens (reloads the model if the context changes)"><span class="pk">Max <em>think</em></span><span class="label">reason · 32K</span></button>
+      <button type="button" class="preset" id="p-speed" title="Thinking off, MTP speculation on, Qwen's chat sampler, animation off"><span class="pk">Max <em>speed</em></span><span class="label">direct · MTP</span></button>
+    </div>
     <div class="ledger" id="sampling"></div>
 
     <div class="sh"><span class="i">03</span><span class="l">System</span><span class="r"></span></div>
