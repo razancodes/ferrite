@@ -35,6 +35,8 @@ pub struct Engine {
     pub fast_head: bool,
     pub head_delta: f32,
     pub head_cap: usize,
+    /// maximum prompt-lookup draft length (0 = off; see `lookup_drafts`)
+    pub lookup_k: usize,
     last_logits: Vec<f32>,
     /// `last_logits` belong to the current end of the sequence
     logits_fresh: bool,
@@ -64,6 +66,8 @@ pub struct GenStats {
     pub stop: StopReason,
     pub drafted: usize,
     pub accepted: usize,
+    /// drafts proposed by prompt lookup (a subset of `drafted`)
+    pub lookup_drafted: usize,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +135,7 @@ impl Engine {
             fast_head: env_or("FERRITE_FAST_HEAD", 1u8) != 0,
             head_delta: env_or("FERRITE_HEAD_DELTA", 8.0f32),
             head_cap: env_or("FERRITE_HEAD_CAP", 256usize),
+            lookup_k: env_or("FERRITE_LOOKUP_K", 8usize),
             last_logits: Vec::new(),
             logits_fresh: false,
             snapshot: None,
@@ -195,9 +200,16 @@ impl Engine {
     /// the following ones by feeding the MTP head its own output, stopping
     /// early once the head is unsure. The MTP position is rewound afterwards so
     /// the speculative cache entries get recomputed from the verified states.
-    fn draft_chain(&mut self, next: u32, k: usize) -> Result<Vec<u32>> {
+    /// With a prompt-lookup proposal whose first token agrees with the MTP
+    /// head's first draft, the proposal is used instead of chaining further
+    /// (returns true): lookup alone is often wrong (60% vs 65% acceptance on a
+    /// summary), but confirmed by the MTP head its continuation is free.
+    fn draft_chain(&mut self, next: u32, k: usize, lookup: Option<Vec<u32>>) -> Result<(Vec<u32>, bool)> {
         let h = self.hidden();
         let (first, mut conf) = self.mtp_catchup(Some(next))?.expect("draft");
+        if let Some(l) = lookup.filter(|l| l[0] == first) {
+            return Ok((l, true));
+        }
         let base = self.state.mtp_pos;
         let mut drafts = vec![first];
         while drafts.len() < k && conf >= self.draft_conf {
@@ -209,7 +221,27 @@ impl Engine {
             conf = c;
         }
         self.state.mtp_pos = base;
-        Ok(drafts)
+        Ok((drafts, false))
+    }
+
+    /// Prompt-lookup drafting: when the last `LOOKUP_NGRAM` tokens (ending with
+    /// `next`) occurred earlier in the sequence, propose the up to `max` tokens
+    /// that followed their latest earlier occurrence. Free (no model work) and
+    /// often long on summaries, quotes, code edits and repeated structure.
+    fn lookup_drafts(&self, next: u32, max: usize) -> Option<Vec<u32>> {
+        const LOOKUP_NGRAM: usize = 3;
+        let toks = &self.state.tokens;
+        let len = toks.len();
+        if max < 2 || len < LOOKUP_NGRAM + 2 {
+            return None;
+        }
+        let tail = &toks[len + 1 - LOOKUP_NGRAM..];
+        // occurrences at i..i+n with a continuation inside the history, newest first
+        (0..len - LOOKUP_NGRAM).rev().find_map(|i| {
+            let hit = toks[i + LOOKUP_NGRAM - 1] == next && toks[i..i + LOOKUP_NGRAM - 1] == *tail;
+            let cont = &toks[i + LOOKUP_NGRAM..(i + LOOKUP_NGRAM + max).min(len)];
+            (hit && cont.len() >= 2).then(|| cont.to_vec())
+        })
     }
 
     /// Run the MTP head over every queued position whose next token is known.
@@ -437,7 +469,13 @@ impl Engine {
         let h = self.hidden();
         let mut next = sampler.sample(&mut logits);
         sampler.accept(next);
+        // tokens per second of steps drafted by each source (moving averages):
+        // prompt lookup is used while it does at least as well as the MTP head
+        // (+28% on a code edit, -5% on a summary when always on); its estimate
+        // drifts up during MTP steps so it gets retried
+        let (mut rate_lookup, mut rate_mtp): (Option<f32>, Option<f32>) = (None, None);
         'outer: loop {
+            let t_step = Instant::now();
             stats.gen_tokens += 1;
             if stop.contains(&next) {
                 stats.stop = StopReason::Eos;
@@ -452,18 +490,29 @@ impl Engine {
                 break;
             }
             let k = self.draft_k.clamp(1, max_new - stats.gen_tokens);
-            if self.state.pos + k + 1 >= self.state.max_ctx {
+            let kl = self.lookup_k.min(max_new - stats.gen_tokens);
+            if self.state.pos + k.max(kl) + 1 >= self.state.max_ctx {
                 stats.stop = StopReason::Context;
                 break;
             }
             self.set_width(2);
-            let drafts = self.draft_chain(next, k)?;
+            let try_lookup = match (rate_lookup, rate_mtp) {
+                (Some(l), Some(m)) => l >= m,
+                _ => true,
+            };
+            let lookup = if try_lookup { self.lookup_drafts(next, kl) } else { None };
+            let (drafts, looked_up) = self.draft_chain(next, k, lookup)?;
+            if looked_up {
+                stats.lookup_drafted += drafts.len();
+            }
             let n = drafts.len();
             let p = self.state.pos;
             let mut batch = Vec::with_capacity(n + 1);
             batch.push(next);
             batch.extend_from_slice(&drafts);
             self.model.forward_ckpt(&self.pool, &mut self.state, &mut self.sc, &batch, n)?;
+            // MTP inputs still queued from earlier steps (lookup steps skip the MTP head)
+            let queued = self.state.mtp_hidden.len();
             self.push_mtp_hidden(0, n + 1);
             self.head_logits(0, n + 1);
             let mut accepted = 0;
@@ -489,10 +538,18 @@ impl Engine {
                     break;
                 }
             }
+            let rate = (accepted + 1) as f32 / t_step.elapsed().as_secs_f32().max(1e-6);
+            let ema = |old: Option<f32>| Some(old.map_or(rate, |o| 0.7 * o + 0.3 * rate));
+            if looked_up {
+                rate_lookup = ema(rate_lookup);
+            } else {
+                rate_mtp = ema(rate_mtp);
+                rate_lookup = rate_lookup.map(|l| l * 1.02);
+            }
             if accepted < n {
                 // undo the unaccepted drafts: recurrent state <- checkpoint, KV length <- p+1+accepted
                 self.model.rollback(&self.pool, &mut self.state, p + 1 + accepted, accepted);
-                self.state.mtp_hidden.truncate((accepted + 1) * h);
+                self.state.mtp_hidden.truncate(queued + (accepted + 1) * h);
             }
             if let Some(r) = halt {
                 stats.stop = r;

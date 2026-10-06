@@ -362,7 +362,7 @@ fn print_stats(st: &ferrite::engine::GenStats) {
         st.gen_tps(),
         st.stop,
         if st.drafted > 0 {
-            format!(" | draft acceptance {:.1}% ({}/{})", st.acceptance() * 100.0, st.accepted, st.drafted)
+            format!(" | draft acceptance {:.1}% ({}/{}, {} by prompt lookup)", st.acceptance() * 100.0, st.accepted, st.drafted, st.lookup_drafted)
         } else {
             String::new()
         }
