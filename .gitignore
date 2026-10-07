@@ -10,3 +10,6 @@ app/gen/
 /bench/engines/
 /bench/runs/*
 !/bench/runs/results.jsonl
+
+# local tool settings
+.claude/

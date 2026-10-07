@@ -20,7 +20,7 @@ struct ModelArgs {
     /// path to a .ferrite model file
     #[arg(short, long)]
     model: PathBuf,
-    /// worker threads (default: number of physical cores)
+    /// worker threads (default: all logical cores; decode uses fewer, see FERRITE_DECODE_THREADS)
     #[arg(short, long)]
     threads: Option<usize>,
     /// maximum context length (tokens)
@@ -89,7 +89,7 @@ enum Cmd {
         hf: PathBuf,
         #[arg(short, long)]
         out: PathBuf,
-        /// f32 | q8 | q4 | q4-fast
+        /// f32 | q8 | q6 | q4 | q4-fast, plus overrides (e.g. "q4,down=q8,lm_proxy=none")
         #[arg(short, long, default_value = "q8")]
         quant: String,
         /// importance matrix (from `ferrite imatrix`) used for 4-bit quantization

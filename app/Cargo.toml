@@ -3,6 +3,8 @@ name = "ferrite-app"
 version = "0.2.0"
 edition = "2024"
 description = "ferrite chat: desktop app (Tauri) for the ferrite CPU inference engine"
+license = "MIT"
+repository = "https://github.com/razancodes/ferrite"
 
 [[bin]]
 name = "ferrite-chat"

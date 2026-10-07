@@ -3,6 +3,8 @@ name = "ferrite"
 version = "0.1.0"
 edition = "2024"
 description = "A from-scratch CPU inference engine for Qwen3.5 / Qwen3.8-architecture language models"
+license = "MIT"
+repository = "https://github.com/razancodes/ferrite"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
