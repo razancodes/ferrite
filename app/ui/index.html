@@ -17,7 +17,7 @@
   <div class="crumb"><b>FERRITE</b><span class="sep">/</span><span id="crumb-model">CHAT</span></div>
   <nav class="toggles" aria-label="Settings">
     <button class="tog" id="t-think" title="Reason step by step before answering (or start a message with /think)"><span class="k">THINK</span><i data-v="on">ON</i>/<i data-v="off">OFF</i></button>
-    <button class="tog" id="t-spec" title="Self-speculative decoding with the model's MTP head — same output, faster"><span class="k">SPEC</span><i data-v="on">ON</i>/<i data-v="off">OFF</i></button>
+    <button class="tog" id="t-spec" title="Self-speculative decoding: the model's MTP head drafts tokens, prompt lookup copies repeated text — same output, faster"><span class="k">SPEC</span><i data-v="on">ON</i>/<i data-v="off">OFF</i></button>
     <button class="tog" id="t-motion" title="Animated dither field"><span class="k">MOTION</span><i data-v="on">ON</i>/<i data-v="off">OFF</i></button>
     <button class="tog" id="t-theme" title="Theme"><i data-v="ink">INK</i>/<i data-v="paper">PAPER</i></button>
     <button class="tog" id="t-new" title="New chat (Ctrl+N)"><span class="kbd">NEW CHAT</span></button>
@@ -64,7 +64,7 @@
             <div class="hero-text">
               <div class="eyebrow">Local inference · CPU · offline</div>
               <h1>Ask anything,<br><em>locally.</em></h1>
-              <p class="lede">Qwen3.5 running on ferrite — a from-scratch Rust engine with AVX-512 kernels and speculative decoding.</p>
+              <p class="lede">Qwen3.5 running on ferrite — a from-scratch Rust engine with AVX-512 kernels, GPTQ 4-bit weights, a 2-bit proxy LM head and speculative decoding.</p>
               <div class="status" id="hero-status"><span class="chip dim">no model</span></div>
             </div>
             <figure class="fig" aria-hidden="true">

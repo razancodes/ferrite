@@ -109,14 +109,20 @@ impl Writer {
     }
 }
 
-/// Append (or replace) a raw tensor in an existing model file without
-/// rewriting the weights: the new bytes go where the old header was, followed
-/// by a new header and footer. The file must not be memory-mapped elsewhere.
-pub fn append_tensor(path: &Path, name: &str, dtype: DType, shape: &[usize], data: &[u8]) -> Result<()> {
+/// A model file's header, read from its footer without loading the weights.
+pub fn read_header(path: &Path) -> Result<Header> {
+    let mut f = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    Ok(header_at(&mut f, path)?.1)
+}
+
+/// (offset, header) from the footer: [header offset u64][header len u64][MAGIC].
+fn header_at(f: &mut File, path: &Path) -> Result<(u64, Header)> {
     use std::io::{Read, SeekFrom};
-    let mut f = std::fs::OpenOptions::new().read(true).write(true).open(path).with_context(|| format!("open {}", path.display()))?;
     let n = f.metadata()?.len();
     let mut footer = [0u8; 24];
+    if n < 32 {
+        bail!("{} is not a ferrite model file", path.display());
+    }
     f.seek(SeekFrom::Start(n - 24))?;
     f.read_exact(&mut footer)?;
     if &footer[16..] != MAGIC {
@@ -127,10 +133,18 @@ pub fn append_tensor(path: &Path, name: &str, dtype: DType, shape: &[usize], dat
     let mut hj = vec![0u8; len];
     f.seek(SeekFrom::Start(off))?;
     f.read_exact(&mut hj)?;
-    let mut header: Header = serde_json::from_slice(&hj)?;
+    Ok((off, serde_json::from_slice(&hj).context("parse header")?))
+}
+
+/// Append (or replace) a raw tensor in an existing model file without
+/// rewriting the weights: the new bytes go where the old header was, followed
+/// by a new header and footer. The file must not be memory-mapped elsewhere.
+pub fn append_tensor(path: &Path, name: &str, dtype: DType, shape: &[usize], data: &[u8]) -> Result<()> {
+    let mut f = std::fs::OpenOptions::new().read(true).write(true).open(path).with_context(|| format!("open {}", path.display()))?;
+    let (off, mut header) = header_at(&mut f, path)?;
     header.tensors.retain(|t| t.name != name);
     let pos = off.div_ceil(ALIGN) * ALIGN;
-    f.seek(SeekFrom::Start(off))?;
+    f.seek(std::io::SeekFrom::Start(off))?;
     f.write_all(&vec![0u8; (pos - off) as usize])?;
     f.write_all(data)?;
     header.tensors.push(TensorInfo { name: name.into(), dtype, shape: shape.to_vec(), offset: pos, nbytes: data.len() as u64, rot: 0 });

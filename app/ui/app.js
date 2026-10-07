@@ -280,11 +280,12 @@
     if (sys) rows.push(["CPU", sys.cpu], ["Threads", info ? `${info.threads} · ${info.decode_threads} decode` : `${sys.default_threads}`]);
     if (info) {
       rows.push(
-        ["Model", `${fmt(info.params_b, 2)}B · ${info.recipe}`],
+        ["Model", `${fmt(info.params_b, 2)}B · ${info.recipe}${info.gptq ? " · GPTQ" : ""}`],
         ["Layers", `${info.layers} · ${info.linear_layers} DeltaNet + ${info.attn_layers} attn`],
-        ["Weights", `${fmt(info.weights_gb, 2)} GB · mmap`],
+        ["Weights", `${fmt(info.weights_gb, 2)} GB · ${info.in_ram ? "in RAM" : "mmap"}`],
+        ["LM head", info.proxy_head ? "2-bit proxy → exact shortlist" : "full"],
         ["Context", `${thousands(contextUsed)} / ${thousands(info.ctx)}`],
-        ["Speculation", info.spec ? "MTP · on" : info.has_mtp ? "off" : "n/a"]
+        ["Speculation", info.spec ? "MTP + prompt lookup" : info.has_mtp ? "off" : "n/a"]
       );
     }
     kv.innerHTML = rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd title="${esc(v)}">${esc(v)}</dd>`).join("");
@@ -353,7 +354,7 @@
   function renderStatus() {
     const st = $("hero-status");
     if (loadingName) st.innerHTML = `<span class="chip live">loading ${esc(loadingName)}</span>`;
-    else if (info) st.innerHTML = `<span class="chip">ready — ${esc(prettyName(info.name).plain)} · ${esc(info.recipe)}</span><span class="label">${info.spec ? "MTP speculation" : "standard decoding"} · loaded in ${fmt(info.load_secs, 1)} s</span>`;
+    else if (info) st.innerHTML = `<span class="chip">ready — ${esc(prettyName(info.name).plain)} · ${esc(info.recipe)}</span><span class="label">${info.spec ? "MTP + lookup speculation" : "standard decoding"}${info.proxy_head ? " · proxy LM head" : ""} · loaded in ${fmt(info.load_secs, 1)} s</span>`;
     else st.innerHTML = `<span class="chip dim">no model</span><span class="label">pick one on the left</span>`;
     $("crumb-model").textContent = info ? prettyName(info.name).plain : loadingName ? "loading…" : "chat";
     $("input").disabled = !info;
@@ -474,6 +475,7 @@
         `prompt ${thousands(stats.prompt_tokens - stats.cached_tokens)}${stats.cached_tokens ? ` <span class="acc">+${thousands(stats.cached_tokens)} cached</span>` : ""}`,
       ];
       if (stats.drafted) parts.push(`accept <b>${Math.round(stats.acceptance * 100)}%</b>`);
+      if (stats.lookup) parts.push(`<span class="acc">${thousands(stats.lookup)} drafted by lookup</span>`);
       parts.push(`first token ${Math.round(stats.ttft_ms)} ms`);
       if (stats.stop === "stopped") parts.push(`<span class="acc">stopped</span>`);
       if (stats.stop === "length") parts.push(`<span class="acc">max tokens</span>`);

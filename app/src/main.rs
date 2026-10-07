@@ -60,12 +60,12 @@ fn model_dirs() -> Vec<PathBuf> {
 fn describe(p: &Path) -> Option<ModelEntry> {
     let size_gb = std::fs::metadata(p).ok()?.len() as f64 / 1e9;
     let name = p.file_stem()?.to_string_lossy().to_string();
-    // read only the header (the file is memory-mapped lazily and closed again)
-    let (params_b, layers, recipe) = match ferrite::format::ModelFile::open(p) {
-        Ok(f) => (
-            f.header.meta.get("params").and_then(|v| v.as_f64()).unwrap_or(0.0) / 1e9,
-            f.header.config.n_layers,
-            f.header.meta.get("recipe").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+    // read only the header, never the weights
+    let (params_b, layers, recipe) = match ferrite::format::read_header(p) {
+        Ok(h) => (
+            h.meta.get("params").and_then(|v| v.as_f64()).unwrap_or(0.0) / 1e9,
+            h.config.n_layers,
+            h.meta.get("recipe").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         ),
         Err(_) => (0.0, 0, String::new()),
     };
@@ -193,6 +193,15 @@ fn cpu_brand() -> String {
 }
 
 fn main() {
+    // Load weights into RAM (one sequential read) rather than memory-mapping
+    // them: on a spinning disk a cold mmap faults pages in at random and can
+    // take many minutes, and fresh heap pages decode faster on this laptop's
+    // flex-mode memory. This is how the benchmarks load. FERRITE_LOAD=mmap
+    // opts out.
+    if std::env::var_os("FERRITE_LOAD").is_none() {
+        // SAFETY: first thing in main, before any other thread exists
+        unsafe { std::env::set_var("FERRITE_LOAD", "heap") };
+    }
     // run from the repo root when launched from target/release so ./models resolves
     if let Ok(exe) = std::env::current_exe() {
         if let Some(root) = exe.parent().and_then(|d| d.parent()).and_then(|d| d.parent()) {
