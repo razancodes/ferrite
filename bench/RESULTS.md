@@ -8,62 +8,77 @@ Method notes: throughput is measured warm (a discarded warm-up first); ferrite l
 
 ## Speed without speculation (pp512 / tg128, tok/s, median)
 
-| Model | Bits | Engine · format | Size GB | Prefill | Decode (sample range) | Passes | ferrite Δ prefill | ferrite Δ decode |
+| Model | Bits | Engine · format | Size GB | Prefill | Decode (sample range) | Passes | newest ferrite Δ prefill | newest ferrite Δ decode |
 |---|---|---|---|---|---|---|---|---|
-| 0.8b | 8-bit | ferrite · q8 | 0.84 | 336.9 | 18.3 (17.7–20.7) | 1 |  |  |
-| 0.8b | 8-bit | llama.cpp · Q8_0 | 0.83 | 120.26 | 21.93 (19.5–22.9) | 2 | +180% | -17% |
-| 0.8b | 8-bit | mistral.rs · Q8_0 | 0.83 | 160.9 | 17.5 (17.5–17.5) | 1 | +109% | +5% |
-| 0.8b | 8-bit | openvino · int8 | 1.04 | 60.33 | 18.43 (12.8–18.5) | 1 | +458% | -1% |
-| 0.8b | 6-bit | ferrite · q6 | 0.64 | 397.6 | 32.89 (32.3–33.4) | 1 |  |  |
-| 0.8b | 6-bit | llama.cpp · Q6_K | 0.65 | 239.24 | 29.38 (27.9–30.4) | 2 | +66% | +12% |
-| 0.8b | 6-bit | mistral.rs · Q6_K | 0.65 | 143.6 | 16.7 (16.7–16.7) | 1 | +177% | +97% |
-| 0.8b | 4-bit | ferrite · q4 | 0.6 | 431.3 | 32.91 (32.7–33.1) | 1 |  |  |
-| 0.8b | 4-bit | llama.cpp · Q4_K_M | 0.54 | 229.34 | 28.98 (18.1–32.2) | 2 | +88% | +14% |
-| 0.8b | 4-bit | llama.cpp · IQ4_NL | 0.53 | 208.08 | 30.03 (23.2–33.4) | 2 | +107% | +10% |
-| 0.8b | 4-bit | mistral.rs · Q4_K_M | 0.54 | 158.9 | 18.5 (18.5–18.5) | 1 | +171% | +78% |
-| 0.8b | 4-bit | openvino · int4 | 0.8 | 46.68 | 23.46 (15.5–23.6) | 1 | +824% | +40% |
+| 0.8b | 8-bit | ferrite v2 · q8 | 0.92 | 500.5 | 33.09 (31.4–35.1) | 2 |  |  |
+| 0.8b | 8-bit | ferrite · q8 | 0.84 | 336.9 | 18.3 (17.7–20.7) | 1 | +49% | +81% |
+| 0.8b | 8-bit | llama.cpp · Q8_0 | 0.83 | 120.26 | 21.93 (19.5–22.9) | 2 | +316% | +51% |
+| 0.8b | 8-bit | mistral.rs · Q8_0 | 0.83 | 160.9 | 17.5 (17.5–17.5) | 1 | +211% | +89% |
+| 0.8b | 8-bit | openvino · int8 | 1.04 | 60.33 | 18.43 (12.8–18.5) | 1 | +730% | +80% |
+| 0.8b | 6-bit | ferrite v2 · q6 | 0.72 | 514.05 | 41.2 (37.9–44.3) | 2 |  |  |
+| 0.8b | 6-bit | ferrite · q6 | 0.64 | 397.6 | 32.89 (32.3–33.4) | 1 | +29% | +25% |
+| 0.8b | 6-bit | llama.cpp · Q6_K | 0.65 | 239.24 | 29.38 (27.9–30.4) | 2 | +115% | +40% |
+| 0.8b | 6-bit | mistral.rs · Q6_K | 0.65 | 143.6 | 16.7 (16.7–16.7) | 1 | +258% | +147% |
+| 0.8b | 4-bit | ferrite v2 · q4 | 0.68 | 589.55 | 46.98 (45.0–49.3) | 2 |  |  |
+| 0.8b | 4-bit | ferrite · q4 | 0.6 | 431.3 | 32.91 (32.7–33.1) | 1 | +37% | +43% |
+| 0.8b | 4-bit | llama.cpp · Q4_K_M | 0.54 | 229.34 | 28.98 (18.1–32.2) | 2 | +157% | +62% |
+| 0.8b | 4-bit | llama.cpp · IQ4_NL | 0.53 | 208.08 | 30.03 (23.2–33.4) | 2 | +183% | +56% |
+| 0.8b | 4-bit | mistral.rs · Q4_K_M | 0.54 | 158.9 | 18.5 (18.5–18.5) | 1 | +271% | +154% |
+| 0.8b | 4-bit | openvino · int4 | 0.8 | 46.68 | 23.46 (15.5–23.6) | 1 | +1163% | +100% |
 | 0.8b | 16/32-bit | transformers · f32 | 3.2 | 95.9 | 4.56 (3.0–4.9) | 2 |  |  |
-| 2b | 8-bit | ferrite · q8 | 2.08 | 199.45 | 9.31 (9.1–9.4) | 2 |  |  |
-| 2b | 8-bit | llama.cpp · Q8_0 | 2.08 | 62.92 | 9.51 (8.9–9.8) | 3 | +217% | -2% |
-| 2b | 8-bit | mistral.rs · Q8_0 | 2.08 | 87.0 | 8.3 (8.3–8.3) | 1 | +129% | +12% |
-| 2b | 8-bit | openvino · int8 | 2.47 | 45.78 | 8.83 (7.8–8.9) | 1 | +336% | +5% |
-| 2b | 6-bit | ferrite · q6 | 1.59 | 184.05 | 12.87 (12.0–13.9) | 2 |  |  |
-| 2b | 6-bit | llama.cpp · Q6_K | 1.61 | 130.47 | 12.47 (11.8–13.2) | 2 | +41% | +3% |
-| 2b | 6-bit | mistral.rs · Q6_K | 1.61 | 86.0 | 9.5 (9.5–9.5) | 1 | +114% | +35% |
-| 2b | 4-bit | ferrite · q4 | 1.41 | 198.6 | 13.41 (13.0–15.0) | 2 |  |  |
-| 2b | 4-bit | llama.cpp · Q4_K_M | 1.31 | 120.94 | 13.95 (13.3–14.4) | 2 | +64% | -4% |
-| 2b | 4-bit | llama.cpp · IQ4_NL | 1.27 | 104.45 | 15.22 (15.0–15.3) | 2 | +90% | -12% |
-| 2b | 4-bit | mistral.rs · Q4_K_M | 1.31 | 95.8 | 9.7 (9.7–9.7) | 1 | +107% | +38% |
-| 2b | 4-bit | openvino · int4 | 1.78 | 45.14 | 12.44 (10.8–12.5) | 1 | +340% | +8% |
-| 4b | 8-bit | ferrite · q8 | 4.61 | 80.65 | 4.33 (3.6–4.8) | 2 |  |  |
-| 4b | 8-bit | llama.cpp · Q8_0 | 4.61 | 23.93 | 4.21 (4.1–4.3) | 2 | +237% | +3% |
-| 4b | 8-bit | mistral.rs · Q8_0 | 4.61 | 35.7 | 3.6 (3.6–3.6) | 1 | +126% | +20% |
-| 4b | 8-bit | openvino · int8 | 4.98 | 17.72 | 3.68 (3.7–3.7) | 1 | +355% | +18% |
-| 4b | 6-bit | ferrite · q6 | 3.53 | 71.8 | 5.35 (5.2–5.6) | 2 |  |  |
-| 4b | 6-bit | llama.cpp · Q6_K | 3.56 | 51.3 | 5.23 (5.0–5.5) | 2 | +40% | +2% |
-| 4b | 6-bit | mistral.rs · Q6_K | 3.56 | 32.8 | 4.2 (4.2–4.2) | 1 | +119% | +27% |
-| 4b | 4-bit | ferrite · q4 | 2.94 | 80.15 | 6.67 (6.2–7.3) | 2 |  |  |
-| 4b | 4-bit | llama.cpp · Q4_K_M | 2.78 | 49.25 | 6.48 (6.1–6.6) | 2 | +63% | +3% |
-| 4b | 4-bit | llama.cpp · IQ4_NL | 2.68 | 42.68 | 6.82 (6.7–6.8) | 2 | +88% | -2% |
-| 4b | 4-bit | mistral.rs · Q4_K_M | 2.78 | 35.2 | 4.3 (4.3–4.3) | 1 | +128% | +55% |
-| 4b | 4-bit | openvino · int4 | 3.22 | 17.51 | 5.34 (4.8–5.4) | 1 | +358% | +25% |
+| 2b | 8-bit | ferrite v2 · q8 | 2.24 | 246.0 | 13.25 (13.0–13.3) | 2 |  |  |
+| 2b | 8-bit | ferrite · q8 | 2.08 | 199.45 | 9.31 (9.1–9.4) | 2 | +23% | +42% |
+| 2b | 8-bit | llama.cpp · Q8_0 | 2.08 | 62.92 | 9.51 (8.9–9.8) | 3 | +291% | +39% |
+| 2b | 8-bit | mistral.rs · Q8_0 | 2.08 | 87.0 | 8.3 (8.3–8.3) | 1 | +183% | +60% |
+| 2b | 8-bit | openvino · int8 | 2.47 | 45.78 | 8.83 (7.8–8.9) | 1 | +437% | +50% |
+| 2b | 6-bit | ferrite v2 · q6 | 1.75 | 191.7 | 17.44 (16.2–18.7) | 2 |  |  |
+| 2b | 6-bit | ferrite · q6 | 1.59 | 184.05 | 12.87 (12.0–13.9) | 2 | +4% | +36% |
+| 2b | 6-bit | llama.cpp · Q6_K | 1.61 | 130.47 | 12.47 (11.8–13.2) | 2 | +47% | +40% |
+| 2b | 6-bit | mistral.rs · Q6_K | 1.61 | 86.0 | 9.5 (9.5–9.5) | 1 | +123% | +84% |
+| 2b | 4-bit | ferrite v2 · q4 | 1.57 | 221.95 | 21.66 (20.6–22.6) | 2 |  |  |
+| 2b | 4-bit | ferrite · q4 | 1.41 | 198.6 | 13.41 (13.0–15.0) | 2 | +12% | +62% |
+| 2b | 4-bit | llama.cpp · Q4_K_M | 1.31 | 120.94 | 13.95 (13.3–14.4) | 2 | +84% | +55% |
+| 2b | 4-bit | llama.cpp · IQ4_NL | 1.27 | 104.45 | 15.22 (15.0–15.3) | 2 | +112% | +42% |
+| 2b | 4-bit | mistral.rs · Q4_K_M | 1.31 | 95.8 | 9.7 (9.7–9.7) | 1 | +132% | +123% |
+| 2b | 4-bit | openvino · int4 | 1.78 | 45.14 | 12.44 (10.8–12.5) | 1 | +392% | +74% |
+| 4b | 8-bit | ferrite v2 · q8 | 4.81 | 89.4 | 5.42 (5.3–5.7) | 2 |  |  |
+| 4b | 8-bit | ferrite · q8 | 4.61 | 80.65 | 4.33 (3.6–4.8) | 2 | +11% | +25% |
+| 4b | 8-bit | llama.cpp · Q8_0 | 4.61 | 23.93 | 4.21 (4.1–4.3) | 2 | +274% | +29% |
+| 4b | 8-bit | mistral.rs · Q8_0 | 4.61 | 35.7 | 3.6 (3.6–3.6) | 1 | +150% | +51% |
+| 4b | 8-bit | openvino · int8 | 4.98 | 17.72 | 3.68 (3.7–3.7) | 1 | +405% | +47% |
+| 4b | 6-bit | ferrite v2 · q6 | 3.73 | 79.05 | 7.31 (7.2–7.3) | 2 |  |  |
+| 4b | 6-bit | ferrite · q6 | 3.53 | 71.8 | 5.35 (5.2–5.6) | 2 | +10% | +37% |
+| 4b | 6-bit | llama.cpp · Q6_K | 3.56 | 51.3 | 5.23 (5.0–5.5) | 2 | +54% | +40% |
+| 4b | 6-bit | mistral.rs · Q6_K | 3.56 | 32.8 | 4.2 (4.2–4.2) | 1 | +141% | +74% |
+| 4b | 4-bit | ferrite v2 · q4 | 3.14 | 88.2 | 9.75 (8.9–10.2) | 2 |  |  |
+| 4b | 4-bit | ferrite · q4 | 2.94 | 80.15 | 6.67 (6.2–7.3) | 2 | +10% | +46% |
+| 4b | 4-bit | llama.cpp · Q4_K_M | 2.78 | 49.25 | 6.48 (6.1–6.6) | 2 | +79% | +50% |
+| 4b | 4-bit | llama.cpp · IQ4_NL | 2.68 | 42.68 | 6.82 (6.7–6.8) | 2 | +107% | +43% |
+| 4b | 4-bit | mistral.rs · Q4_K_M | 2.78 | 35.2 | 4.3 (4.3–4.3) | 1 | +151% | +127% |
+| 4b | 4-bit | openvino · int4 | 3.22 | 17.51 | 5.34 (4.8–5.4) | 1 | +404% | +83% |
 
 ## End-to-end chat (6 prompts, greedy, ≤256 tokens, thinking off)
 
 | Model | Bits | Engine · format | Speculation | Decode tok/s | Prefill tok/s (long prompt) | Draft acceptance | Peak RAM MB |
 |---|---|---|---|---|---|---|---|
-| 0.8b | 4-bit | ferrite · q4 | MTP ≤4 | 42.94 | 294.3 | 60% | 813 |
-| 0.8b | 4-bit | ferrite · q4 | off | 28.29 | 339.9 | — | 735 |
+| 0.8b | 4-bit | ferrite v2 · q4 | MTP ≤4 | 84.42 | 455.2 | 62% | 907 |
+| 0.8b | 4-bit | ferrite v2 · q4 | off | 60.55 | 467.0 | — | 810 |
+| 0.8b | 4-bit | ferrite · q4 | MTP ≤4 | 51.0 (median of 2) | 338.8 | 60% | 812 |
+| 0.8b | 4-bit | ferrite · q4 | off | 35.19 (median of 2) | 312.8 | — | 735 |
 | 0.8b | 4-bit | llama.cpp · Q4_K_M | MTP ≤3 | 18.21 | 173.7 | 48% | 1323 |
 | 0.8b | 4-bit | llama.cpp · Q4_K_M | off | 23.91 | 182.1 | — | 1272 |
 | 0.8b | 4-bit | openvino · int4 | MTP ≤2 | 13.97 | 41.3 | — | 2120 |
 | 0.8b | 4-bit | openvino · int4 | off | 16.66 | 39.1 | — | 1706 |
+| 2b | 8-bit | ferrite v2 · q8 | MTP ≤4 | 27.41 | 199.6 | 66% | 2461 |
+| 2b | 8-bit | ferrite v2 · q8 | off | 15.7 | 210.0 | — | 2306 |
 | 2b | 8-bit | ferrite · q8 | MTP ≤4 | 19.9 | 187.9 | 66% | 2279 |
 | 2b | 8-bit | ferrite · q8 | off | 10.18 | 208.7 | — | 2155 |
 | 2b | 8-bit | llama.cpp · Q8_0 | MTP ≤3 | 11.06 | 61.4 | 54% | 2765 |
 | 2b | 8-bit | llama.cpp · Q8_0 | off | 9.14 | 56.6 | — | 2493 |
 | 2b | 8-bit | openvino · int8 | MTP ≤2 | 6.92 | 44.0 | — | 5366 |
 | 2b | 8-bit | openvino · int8 | off | 9.21 | 37.4 | — | 4373 |
+| 2b | 6-bit | ferrite v2 · q6 | MTP ≤4 | 31.97 | 154.6 | 66% | 1984 |
+| 2b | 6-bit | ferrite v2 · q6 | off | 20.27 | 166.5 | — | 1843 |
 | 2b | 6-bit | ferrite · q6 | MTP ≤4 | 28.02 | 144.3 | 65% | 1802 |
 | 2b | 6-bit | ferrite · q6 | off | 16.48 | 140.1 | — | 1692 |
 | 2b | 6-bit | llama.cpp · Q6_K | MTP ≤3 | 9.31 | 106.7 | 55% | 2323 |
@@ -71,12 +86,16 @@ Method notes: throughput is measured warm (a discarded warm-up first); ferrite l
 | 2b | 6-bit | llama.cpp · Q6_K | MTP ≤2 | 10.43 | 91.0 | 67% | 2303 |
 | 2b | 6-bit | llama.cpp · Q6_K | MTP ≤4 | 6.93 | 105.6 | 46% | 2343 |
 | 2b | 6-bit | llama.cpp · Q6_K | off | 11.02 (median of 4) | 104.1 | — | 2063 |
+| 2b | 4-bit | ferrite v2 · q4 | MTP ≤4 | 35.45 | 174.7 | 61% | 1830 |
+| 2b | 4-bit | ferrite v2 · q4 | off | 28.0 | 219.4 | — | 1672 |
 | 2b | 4-bit | ferrite · q4 | MTP ≤4 | 26.35 | 140.7 | 62% | 1654 |
 | 2b | 4-bit | ferrite · q4 | off | 14.53 | 132.3 | — | 1528 |
 | 2b | 4-bit | llama.cpp · Q4_K_M | MTP ≤3 | 10.28 | 90.4 | 52% | 2507 |
 | 2b | 4-bit | llama.cpp · Q4_K_M | off | 12.33 | 97.1 | — | 2381 |
 | 2b | 4-bit | openvino · int4 | MTP ≤2 | 9.51 | 34.3 | — | 4113 |
 | 2b | 4-bit | openvino · int4 | off | 9.83 | 34.1 | — | 3165 |
+| 4b | 4-bit | ferrite v2 · q4 | MTP ≤4 | 16.91 | 80.4 | 65% | 3528 |
+| 4b | 4-bit | ferrite v2 · q4 | off | 9.38 | 71.6 | — | 3310 |
 | 4b | 4-bit | ferrite · q4 | MTP ≤4 | 11.39 | 60.7 | 64% | 3298 |
 | 4b | 4-bit | ferrite · q4 | off | 6.15 | 60.8 | — | 3119 |
 | 4b | 4-bit | llama.cpp · Q4_K_M | MTP ≤3 | 6.61 | 39.2 | 62% | 5886 |
@@ -86,17 +105,22 @@ Method notes: throughput is measured warm (a discarded warm-up first); ferrite l
 
 Greedy output identical with speculation on and off (first 160 characters of all 6 replies):
 
+* 0.8b 4-bit ferrite v2: 6/6 identical
 * 0.8b 4-bit ferrite: 6/6 identical
 * 0.8b 4-bit llama.cpp: 3/6 identical
 * 0.8b 4-bit openvino: 3/6 identical
+* 2b 8-bit ferrite v2: 6/6 identical
 * 2b 8-bit ferrite: 6/6 identical
 * 2b 8-bit llama.cpp: 6/6 identical
 * 2b 8-bit openvino: 3/6 identical
+* 2b 6-bit ferrite v2: 6/6 identical
 * 2b 6-bit ferrite: 6/6 identical
 * 2b 6-bit llama.cpp: 6/6 identical
+* 2b 4-bit ferrite v2: 6/6 identical
 * 2b 4-bit ferrite: 6/6 identical
 * 2b 4-bit llama.cpp: 3/6 identical
 * 2b 4-bit openvino: 4/6 identical
+* 4b 4-bit ferrite v2: 6/6 identical
 * 4b 4-bit ferrite: 6/6 identical
 * 4b 4-bit llama.cpp: 6/6 identical
 * 4b 4-bit openvino: 4/6 identical
@@ -106,9 +130,11 @@ Greedy output identical with speculation on and off (first 160 characters of all
 | Model | Bits | Engine · format | Size GB | Perplexity |
 |---|---|---|---|---|
 | 0.8b | 16/32-bit | ferrite · f32 | 3.1 | 15.3475 |
+| 0.8b | 16/32-bit | ferrite v2 · f32 | 3.1 | 15.3475 |
 | 0.8b | 16/32-bit | llama.cpp · bf16 | 1.56 | 15.3485 |
 | 0.8b | 8-bit | ferrite · q8 | 0.84 | 15.3236 |
 | 0.8b | 8-bit | llama.cpp · Q8_0 | 0.83 | 15.3767 |
+| 0.8b | 4-bit | ferrite v2 · q4 | 0.68 | 15.783 |
 | 0.8b | 6-bit | llama.cpp · Q6_K | 0.65 | 15.475 |
 | 0.8b | 6-bit | ferrite · q6 | 0.64 | 15.2694 |
 | 0.8b | 4-bit | ferrite · q4 | 0.6 | 15.916 |
@@ -118,6 +144,7 @@ Greedy output identical with speculation on and off (first 160 characters of all
 | 2b | 8-bit | llama.cpp · Q8_0 | 2.08 | 10.4398 |
 | 2b | 6-bit | llama.cpp · Q6_K | 1.61 | 10.4816 |
 | 2b | 6-bit | ferrite · q6 | 1.59 | 10.4658 |
+| 2b | 4-bit | ferrite v2 · q4 | 1.57 | 10.6688 |
 | 2b | 4-bit | ferrite · q4 | 1.41 | 10.7583 |
 | 2b | 4-bit | llama.cpp · Q4_K_M | 1.31 | 10.6674 |
 | 2b | 4-bit | llama.cpp · IQ4_NL | 1.27 | 10.88 |
@@ -125,6 +152,7 @@ Greedy output identical with speculation on and off (first 160 characters of all
 | 4b | 8-bit | llama.cpp · Q8_0 | 4.61 | 8.0619 |
 | 4b | 6-bit | llama.cpp · Q6_K | 3.56 | 8.1175 |
 | 4b | 6-bit | ferrite · q6 | 3.53 | 8.087 |
+| 4b | 4-bit | ferrite v2 · q4 | 3.14 | 8.1958 |
 | 4b | 4-bit | ferrite · q4 | 2.94 | 8.2499 |
 | 4b | 4-bit | llama.cpp · Q4_K_M | 2.78 | 8.1709 |
 | 4b | 4-bit | llama.cpp · IQ4_NL | 2.68 | 8.3334 |

@@ -28,31 +28,51 @@ The vision tower of the checkpoints is ignored (text only).
 
 ## Results (i5-1135G7, Windows 11, decode in tok/s)
 
-| Model | Format | File | Prefill | Decode | **Decode + MTP speculation** | Quality (KL ↓) |
-|---|---|---|---|---|---|---|
-| Qwen3.5-0.8B | q8 | 0.84 GB | ~380 | 26.1 | **39.9** | 0.0007 vs f32 |
-| Qwen3.5-0.8B | q6 | 0.64 GB | ~370 | 30.7 | **50.5** | 0.0057 vs f32 |
-| Qwen3.5-0.8B | q4 | 0.60 GB | ~370 | 33.1 | **57.8** | 0.043 vs f32 |
-| Qwen3.5-2B   | q8 | 2.08 GB | ~170 | 10.3 | **20.5** | reference |
-| Qwen3.5-2B   | q6 | 1.59 GB | ~160 | 11.4–14.3 | **24–26** | 0.0054 vs q8 |
-| Qwen3.5-2B   | q4 | 1.41 GB | ~170 | 15.8 | **27.5** | 0.034 vs q8 |
-| Qwen3.5-4B   | q8 | 4.61 GB | ~70–100 | 3.8–4.4 | **7.4–9.2** | reference |
-| Qwen3.5-4B   | q6 | 3.53 GB | ~70–90 | 5.4–6.2 | **10.8–11.1** | 0.0050 vs q8 |
-| Qwen3.5-4B   | q4 | 2.94 GB | ~70–80 | 6.7–6.8 | **13.8–14.3** | 0.030 vs q8 |
+One session, one launch per row (`ferrite bench`: pp512, tg128 without speculation, and tg128
+with MTP speculation on an essay prompt). Decode on this laptop varies 25–40% between launches
+with where Windows places the weights in its partly single-channel memory, so compare rows
+within this table, not across tables; the interleaved medians below are the better guide to
+absolute speed.
 
-KL is the mean token-level KL divergence on wikitext-2. For scale, q8 matches f32 with 98.5% top-1
-agreement, q6 with ~96%, and q4 with ~88–91%. **Recommended: `q6`** (near-q8 quality at ~25% fewer
-bytes). Use `qwen3.5-2b-q6` for speed, `qwen3.5-4b-q6` for the smartest answers.
+| Model | Format | File | Prefill | Decode | **Decode + MTP** | Wikitext-2 perplexity |
+|---|---|---|---|---|---|---|
+| Qwen3.5-0.8B | q8 | 0.92 GB | 519 | 32.5 | **45.4** | 15.32 |
+| Qwen3.5-0.8B | q6 | 0.72 GB | 455 | 40.8 | **60.1** | 15.27 |
+| Qwen3.5-0.8B | q4 | 0.68 GB | 513 | 49.6 | **63.1** | 15.78 |
+| Qwen3.5-0.8B | q4-fast | 0.66 GB | 520 | 52.0 | **69.9** | 15.97 |
+| Qwen3.5-2B   | q8 | 2.24 GB | 217 | 13.0 | **27.7** | 10.44 |
+| Qwen3.5-2B   | q6 | 1.75 GB | 190 | 18.2 | **36.6** | 10.47 |
+| Qwen3.5-2B   | q4 | 1.57 GB | 211 | 23.4 | **38.8** | 10.67 |
+| Qwen3.5-2B   | q4-fast | 1.52 GB | 215 | 24.8 | **41.7** | 10.71 |
+| Qwen3.5-4B   | q8 | 4.81 GB | 85 | 5.3 | **9.7** | 8.04 |
+| Qwen3.5-4B   | q6 | 3.73 GB | 75 | 7.2 | **11.8** | 8.09 |
+| Qwen3.5-4B   | q4 | 3.14 GB | 84 | 9.6 | **15.4** | 8.20 |
+| Qwen3.5-4B   | q4-fast | 2.97 GB | 85 | 10.2 | **15.9** | 8.22 |
+
+Perplexity: 32 × 512-token wikitext-2 windows, second half scored (f32 0.8B: 15.35). Files include
+the 2-bit proxy LM head (80–200 MB). **Recommended: `q4`** for speed (GPTQ makes it close to q6:
+at 0.8B its KL against q8 is 0.023, q6's 0.006, the old non-GPTQ q4's 0.044) or `q6` for the
+best quality per byte; `q4-fast` is the fastest. `qwen3.5-2b-q4` is a good everyday model,
+`qwen3.5-4b-q4` the smartest that stays fast.
+
+**Decode optimizations (v2), same session, interleaved launches, median of 3:** the same binary
+and files with the v2 features off (`FERRITE_FAST_HEAD=0 FERRITE_LOOKUP_K=0
+FERRITE_DRAFT_FROM=head`) against defaults, and llama.cpp b11425 in the same rounds:
+
+| q4 | v1 decode | **v2 decode** | llama.cpp Q4_K_M | v1 + MTP | **v2 + MTP** | v2 q4-fast + MTP |
+|---|---|---|---|---|---|---|
+| 0.8B | 39.9 | **54.2** (×1.36) | 36.3 | 66.3 | **89.1** (×1.31) | 88.7 |
+| 2B   | 16.1 | **21.6** (×1.34) | 15.3 | 28.9 | **35.5** (×1.22) | 37.5 |
+| 4B   | 7.7  | **9.0** (×1.19)  | 6.6  | 13.9 | **16.6** (×1.17) | 17.5 |
 
 Where the time goes:
 
-* **Decode is memory-bound.** Non-speculative decode streams weights at 19–22 GB/s. A pure AVX-512
-  read benchmark (`examples/bw_bench.rs`) tops out at 22–24 GB/s on this machine, so that's ~90%
-  of what the DRAM delivers. The RAM is a mismatched 16 GB + 4 GB pair running at DDR4-2667
-  (Intel flex mode); a matched 3200 MT/s pair would raise decode speed by roughly 20%.
-* **MTP speculation gives 1.5–2.1x.** The largest gain is on the biggest model, where weight
-  streaming dominates most.
-* Benchmarks on this laptop vary by ±10–15% run to run (thermals, background load).
+* **Decode is memory-bound.** Without speculation every token streams the weights once, at
+  ~22–29 GB/s on this machine. The RAM is 4 GB soldered + a 16 GB DIMM at DDR4-2667 (Intel flex
+  mode: only 8 GB is dual-channel), which also makes speed depend on page placement.
+* **The LM head was the biggest single cost** (248K-token vocabulary: 47% of the bytes per token
+  at 0.8B). A 2-bit proxy now scores the vocabulary and the exact head only the shortlist.
+* **MTP speculation gives 1.5–2x** on top, more with prompt lookup on repetitive text (code edits).
 
 **Correctness** (against Hugging Face transformers 5.15):
 
@@ -71,29 +91,25 @@ Where the time goes:
 
 `bench/` runs ferrite head to head against llama.cpp (b11425), mistral.rs (0.9.4), OpenVINO GenAI
 (2026.4.1) and HF transformers on the same Qwen3.5 checkpoints on this laptop. Full tables and
-method notes: [`bench/RESULTS.md`](bench/RESULTS.md).
+method notes: [`bench/RESULTS.md`](bench/RESULTS.md) (rows labelled `ferrite v2` are this version).
 
-| 2B, 6-bit | ferrite q6 | llama.cpp Q6_K | mistral.rs Q6_K | OpenVINO |
+| 2B, 4-bit | ferrite v2 q4 | llama.cpp Q4_K_M | mistral.rs Q4_K_M | OpenVINO int4 |
 |---|---|---|---|---|
-| Prefill, pp512 (tok/s) | **184** | 130 | 86 | 45 (int4) |
-| Decode, no speculation (tok/s) | **12.9** | 12.5 | 9.5 | 12.4 (int4) |
-| Chat decode with MTP speculation (tok/s) | **28.0** | 13.4 (best of 1–4 drafts) | — | 9.5 (int4) |
-| Peak RAM in chat | **1.8 GB** | 2.3 GB | — | 4.1 GB (int4) |
-| Wikitext-2 perplexity | 10.47 | 10.48 | — | — |
+| Prefill, pp512 (tok/s) | **222** | 121 | 96 | 45 |
+| Decode, no speculation (tok/s) | **21.6** | 15.3 (same session) | 9.7 | 12.4 |
+| Chat decode, best speculation setting (tok/s) | **35.5** | 12.3 (MTP off is its best here) | — | 9.8 |
+| Peak RAM in chat | **1.8 GB** | 2.4 GB | — | 3.2 GB |
+| Wikitext-2 perplexity | **10.67** | 10.67 | (same file) | — |
 
-* **Prefill** is 1.4–3.4× llama.cpp, 2.1–2.8× mistral.rs and 4–9× OpenVINO, at every size and
-  bit width.
-* **Decode without speculation** is memory-bound, so engines converge: within ±5% of llama.cpp at
-  2B/4B, 10–14% ahead at 0.8B 6/4-bit, 17% behind at 0.8B 8-bit. Smaller files win, so
-  llama.cpp's IQ4_NL (11% smaller than our q4) decodes 12% faster at 2B.
-* **Speculation** is the big gap: ferrite's MTP gives 1.5–1.95× in chat; llama.cpp's MTP gives
-  0.76–1.22× (with its default of 3 drafts it is slower than no speculation at 0.8B and at 2B
-  6/4-bit; 1 draft is its best at 2B 6-bit), OpenVINO's 0.75–1.23×. ferrite's speculative output
-  is identical to plain greedy decoding in every run; llama.cpp's and OpenVINO's diverge in some
-  replies.
-* **Quality** at equal size matches or slightly beats llama.cpp at 8 and 6 bits (0.05–1.3% lower
-  perplexity). At 4 bits, ours beats IQ4_NL at every size but trails Q4_K_M by about 1% at 2B/4B
-  while being 6–8% larger.
+* **Prefill** is 1.5–4.2× llama.cpp, 2–3× mistral.rs and 4–9× OpenVINO at every size and bit width.
+* **Decode without speculation**, same session: 1.32–1.49× llama.cpp at 4-bit (the proxy LM head
+  cuts the bytes read per token by 16% at 4B to 32% at 0.8B; before it, engines were at parity).
+* **Speculation**: ferrite's MTP gives 1.5–2× in chat, llama.cpp's 0.76–1.22× (its default of 3
+  drafts is slower than no speculation at 0.8B and 2B 6/4-bit), OpenVINO's 0.75–1.23×. ferrite's
+  speculative output is identical to plain greedy decoding; llama.cpp's and OpenVINO's diverge
+  in some replies.
+* **Quality**: with GPTQ, ferrite's q4 matches llama.cpp's Q4_K_M at 2B (10.67 vs 10.67), beats it
+  at 0.8B (15.78 vs 16.31) and is within 0.3% at 4B; 8- and 6-bit are on par or slightly better.
 * **Memory**: llama.cpp peaks at 1.2–1.8× and OpenVINO at 2.2–2.6× ferrite's RAM in chat.
 
 Reproduce: `bench/prepare.sh` (llama.cpp files), the OpenVINO downloads listed there, then
